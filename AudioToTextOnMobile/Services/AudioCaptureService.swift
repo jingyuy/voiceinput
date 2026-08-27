@@ -63,9 +63,16 @@ final class AudioCaptureService {
     /// cannot be configured or the audio engine fails to start.
     func start() throws {
         let inputNode = audioEngine.inputNode
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
 
         try configureAudioSession()
+
+        // IMPORTANT: resolve the input format AFTER the audio session is
+        // active. Before activation, outputFormat(forBus:) can report a stale
+        // client format (e.g. 48 kHz) that doesn't match the hardware's actual
+        // rate (e.g. 16 kHz once preferredSampleRate is applied). Installing a
+        // tap with that mismatched format throws "Failed to create tap due to
+        // format mismatch" and crashes the app.
+        let recordingFormat = inputFormat(for: inputNode)
 
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
@@ -78,6 +85,24 @@ final class AudioCaptureService {
         } catch {
             throw CaptureError.engineStartFailed(error)
         }
+    }
+
+    /// Resolves the tap format. Prefers the input node's own output format,
+    /// but defensively rebuilds it at the session's actual sample rate if the
+    /// node is still reporting a stale rate.
+    private func inputFormat(for inputNode: AVAudioInputNode) -> AVAudioFormat {
+        let nodeFormat = inputNode.outputFormat(forBus: 0)
+        let sessionRate = audioSession.sampleRate
+        guard abs(nodeFormat.sampleRate - sessionRate) > 1,
+              let rebuilt = AVAudioFormat(
+                  commonFormat: .pcmFormatFloat32,
+                  sampleRate: sessionRate,
+                  channels: nodeFormat.channelCount,
+                  interleaved: false
+              ) else {
+            return nodeFormat
+        }
+        return rebuilt
     }
 
     /// Stops capturing and releases the microphone.
