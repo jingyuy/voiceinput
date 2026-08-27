@@ -36,6 +36,13 @@ enum DictationSharedState {
         static let cancelRequested = "dictation.cancelRequested"
         static let lastActivity = "dictation.lastActivity"
         static let isColdStart = "dictation.isColdStart"
+        /// App-only liveness marker: written ONLY by the container app
+        /// (armed engine, session loop, ping). The keyboard reads it to
+        /// decide Darwin-wake vs cold-launch and to detect app death fast.
+        static let appHeartbeat = "dictation.appHeartbeat"
+        /// Timestamp (ref date) when the app published `.ready` — the
+        /// keyboard's freshness gate for auto-inserting a result.
+        static let readyAt = "dictation.readyAt"
     }
 
     // MARK: - Reads
@@ -69,6 +76,19 @@ enum DictationSharedState {
         return interval > 0 ? Date(timeIntervalSinceReferenceDate: interval) : nil
     }
 
+    /// App-only liveness. Nil means the app has never (or not recently)
+    /// written a heartbeat.
+    static var appHeartbeatDate: Date? {
+        let interval = AppGroup.defaults.double(forKey: Key.appHeartbeat)
+        return interval > 0 ? Date(timeIntervalSinceReferenceDate: interval) : nil
+    }
+
+    /// When the app published the current `.ready` result.
+    static var readyAtDate: Date? {
+        let interval = AppGroup.defaults.double(forKey: Key.readyAt)
+        return interval > 0 ? Date(timeIntervalSinceReferenceDate: interval) : nil
+    }
+
     static func wantsStop(_ defaults: UserDefaults = AppGroup.defaults) -> Bool {
         defaults.bool(forKey: Key.stopRequested)
     }
@@ -84,10 +104,17 @@ enum DictationSharedState {
     static func clearPayload(defaults: UserDefaults = AppGroup.defaults) {
         defaults.removeObject(forKey: Key.liveText)
         defaults.removeObject(forKey: Key.finalText)
+        defaults.removeObject(forKey: Key.readyAt)
         defaults.removeObject(forKey: Key.errorMessage)
         defaults.removeObject(forKey: Key.audioLevel)
         defaults.set(false, forKey: Key.stopRequested)
         defaults.set(false, forKey: Key.cancelRequested)
+    }
+
+    /// Removes a consumed (or expired) final result.
+    static func clearFinalResult(defaults: UserDefaults = AppGroup.defaults) {
+        defaults.removeObject(forKey: Key.finalText)
+        defaults.removeObject(forKey: Key.readyAt)
     }
 
     /// Full reset of the shared state (end of a session).
@@ -96,12 +123,20 @@ enum DictationSharedState {
         defaults.removeObject(forKey: Key.sessionToken)
         defaults.removeObject(forKey: Key.liveText)
         defaults.removeObject(forKey: Key.finalText)
+        defaults.removeObject(forKey: Key.readyAt)
         defaults.removeObject(forKey: Key.errorMessage)
         defaults.removeObject(forKey: Key.audioLevel)
         defaults.set(false, forKey: Key.stopRequested)
         defaults.set(false, forKey: Key.cancelRequested)
         defaults.removeObject(forKey: Key.lastActivity)
         defaults.removeObject(forKey: Key.isColdStart)
+        defaults.removeObject(forKey: Key.appHeartbeat)
+    }
+
+    /// Writes the app-only liveness marker. The keyboard must NEVER call
+    /// this — it is the app's "I'm alive AND can serve" signal.
+    static func touchAppHeartbeat(defaults: UserDefaults = AppGroup.defaults) {
+        defaults.set(Date.timeIntervalSinceReferenceDate, forKey: Key.appHeartbeat)
     }
 
     static func setStatus(_ status: Status, defaults: UserDefaults = AppGroup.defaults) {

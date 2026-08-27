@@ -9,7 +9,9 @@ struct AudioToTextOnMobileApp: App {
         WindowGroup {
             TranscriptionView()
                 .overlay {
-                    if coordinator.isActive {
+                    // Only keyboard-driven sessions get the overlay — the
+                    // app's own sessions live in TranscriptionView.
+                    if coordinator.isActive && !coordinator.isAppSession {
                         DictationSessionOverlay(coordinator: coordinator)
                     }
                 }

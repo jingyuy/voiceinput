@@ -74,17 +74,25 @@ final class KeyboardState: ObservableObject {
     /// must never race it.
     private let transcribeTimeout: TimeInterval = 25
 
-    /// Any heartbeat at all means the app has run before — and with the
-    /// app's silent keep-alive it is (almost always) still alive in the
-    /// background, so a Darwin ping will wake it WITHOUT stealing the
-    /// foreground. Give the wake time to land; only fast-launch when the
-    /// app has never run (first install / never opened).
-    private var hasAppHeartbeat: Bool {
-        DictationSharedState.lastActivityDate != nil
+    /// A FRESH app-heartbeat means the app is alive AND can serve a request
+    /// in the background (its engine is armed, or a session is running). In
+    /// that case a Darwin ping will wake it WITHOUT stealing the foreground,
+    /// so give the wake time to land. A stale/absent heartbeat means the app
+    /// is dead or unarmed — cold-launch it fast (the only way to re-arm).
+    private var appIsAlive: Bool {
+        guard let date = DictationSharedState.appHeartbeatDate else { return false }
+        return Date().timeIntervalSince(date) < 3
     }
 
     private var effectiveColdLaunchDelay: TimeInterval {
-        hasAppHeartbeat ? coldLaunchDelayWhenAppKnown : coldLaunchDelay
+        appIsAlive ? coldLaunchDelayWhenAppKnown : coldLaunchDelay
+    }
+
+    /// The app's session loop (or armed engine) keeps its heartbeat fresh;
+    /// a stale one means the app died (or was force-quit).
+    private func appHeartbeatStale(_ threshold: TimeInterval = 8) -> Bool {
+        guard let date = DictationSharedState.appHeartbeatDate else { return true }
+        return Date().timeIntervalSince(date) > threshold
     }
 
     init(controller: KeyboardViewController) {
@@ -130,6 +138,9 @@ final class KeyboardState: ObservableObject {
         audioLevel = 0
         elapsed = 0
 
+        // Snapshot liveness BEFORE reset() — reset wipes the heartbeat key,
+        // and the app (if alive) only re-touches it after the ping lands.
+        let delay = effectiveColdLaunchDelay
         // Fresh request: token + .requested, then wake the app.
         myToken = UUID().uuidString
         let defaults = AppGroup.defaults
@@ -144,10 +155,10 @@ final class KeyboardState: ObservableObject {
 
         // If the app doesn't acknowledge quickly, it isn't running (or is
         // suspended — Darwin can't wake it) → cold-launch via URL. When the
-        // app was alive recently, wait longer so the Darwin wake lands in
-        // the background instead of stealing the foreground.
+        // app is alive (fresh heartbeat), wait longer so the Darwin wake
+        // lands in the background instead of stealing the foreground.
         watchdogTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(self?.effectiveColdLaunchDelay ?? 1.5))
+            try? await Task.sleep(for: .seconds(delay))
             guard let self, !Task.isCancelled, generation == self.sessionGeneration,
                   self.phase == .starting else { return }
             let status = DictationSharedState.status()
@@ -181,7 +192,7 @@ final class KeyboardState: ObservableObject {
                     if !text.isEmpty {
                         self.insertedFinalText = true
                         self.controller?.insertText(text)
-                        defaults.removeObject(forKey: DictationSharedState.Key.finalText)
+                        DictationSharedState.clearFinalResult(defaults: defaults)
                         DictationSharedState.setStatus(.idle, defaults: defaults)
                         Self.logger.info("stopDictation watchdog: late .ready — inserted final text")
                         self.phase = .ready
@@ -285,7 +296,7 @@ final class KeyboardState: ObservableObject {
             // sitting in the shared store for a long time (app was
             // cold-launched, user never returned) must not surprise-insert
             // into an unrelated field later.
-            let fresh = DictationSharedState.lastActivityDate.map {
+            let fresh = DictationSharedState.readyAtDate.map {
                 Date().timeIntervalSince($0) < 600
             } ?? false
             if !fresh {
@@ -298,7 +309,7 @@ final class KeyboardState: ObservableObject {
             if !text.isEmpty, !insertedFinalText {
                 insertedFinalText = true
                 controller?.insertText(text)
-                defaults.removeObject(forKey: DictationSharedState.Key.finalText)
+                DictationSharedState.clearFinalResult(defaults: defaults)
                 DictationSharedState.setStatus(.idle, defaults: defaults)
                 Self.logger.info("recoverKeyboardSession: inserted final text")
                 phase = .ready
@@ -369,6 +380,13 @@ final class KeyboardState: ObservableObject {
                 phase = .recording
                 startElapsedTimer()
             }
+            // The app's session loop keeps its heartbeat fresh every 250ms.
+            // A stale one means it died (or was force-quit) — fail fast so
+            // the user isn't stuck watching a dead session.
+            if appHeartbeatStale() {
+                fail("The app closed mid-dictation. Open it once, then try again.")
+                return
+            }
             updateLiveText(DictationSharedState.liveText(defaults))
             if let last = lastActivityDate, Date().timeIntervalSince(last) > idleTimeout {
                 // Long silence — wrap up so the session can't leak.
@@ -377,13 +395,19 @@ final class KeyboardState: ObservableObject {
             }
         case .transcribing:
             phase = .transcribing
+            // The app is finalizing; its session loop keeps the heartbeat
+            // fresh. If it died, nothing will ever arrive — fail fast.
+            if appHeartbeatStale() {
+                fail("The app closed while finalizing. Open it once, then try again.")
+                return
+            }
         case .ready:
             let text = DictationSharedState.finalText(defaults)
             if !text.isEmpty, !insertedFinalText {
                 insertedFinalText = true
                 controller?.insertText(text)
                 // Clear so a respawned keyboard process can't double-insert.
-                defaults.removeObject(forKey: DictationSharedState.Key.finalText)
+                DictationSharedState.clearFinalResult(defaults: defaults)
                 DictationSharedState.setStatus(.idle, defaults: defaults)
                 Self.logger.info("pollOnce: inserted final text")
                 phase = .ready
@@ -435,6 +459,7 @@ final class KeyboardState: ObservableObject {
         sharedStatus=\(shared.rawValue)
         token=\(myToken.prefix(8))
         lastActivity=\(DictationSharedState.lastActivityDate.map { String(format: "%.1fs ago", Date().timeIntervalSince($0)) } ?? "nil")
+        appHeartbeat=\(DictationSharedState.appHeartbeatDate.map { String(format: "%.1fs ago", Date().timeIntervalSince($0)) } ?? "nil")
         """
         UIPasteboard.general.string = dump
         watchdogTask?.cancel()

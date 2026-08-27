@@ -72,6 +72,14 @@ final class AudioCaptureService {
     /// may resume (used to re-arm the always-on capture engine).
     var onInterruptionEnded: (() -> Void)?
 
+    /// Called on the main queue when the audio route changed (headphones
+    /// plugged/unplugged, Bluetooth, etc.).
+    var onRouteChanged: (() -> Void)?
+
+    /// Called on the main queue when mediaserverd reset — the engine object
+    /// is dead and must be recreated.
+    var onMediaServicesReset: (() -> Void)?
+
     /// The engine is recreated fresh inside `tryStart` AFTER the audio
     /// session is configured — an engine created early (e.g. at init) can
     /// lock in a 2ch input-node format that the mono hardware then rejects
@@ -84,6 +92,13 @@ final class AudioCaptureService {
     /// almost permanently (always-armed mic) so dictation can start instantly
     /// in the background without re-initializing the input unit.
     private(set) var isRunning = false
+    /// Last time a PCM buffer arrived (any thread). Lets the arm-watcher
+    /// detect an engine that claims to run but is actually dead (session
+    /// stolen by an interruption / route change / media reset).
+    private(set) var lastBufferAt = Date.distantPast
+    /// When the last audio interruption ended — the system then permits a
+    /// background re-arm (unlike the general '!int' 560557684 ban).
+    private(set) var lastInterruptionEndedAt = Date.distantPast
 
     init() {
         NotificationCenter.default.addObserver(
@@ -98,11 +113,37 @@ final class AudioCaptureService {
             case .began:
                 self.onInterruption?()
             case .ended:
+                self.lastInterruptionEndedAt = Date()
                 self.onInterruptionEnded?()
             @unknown default:
                 break
             }
         }
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] _ in
+            self?.onRouteChanged?()
+        }
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            // mediaserverd died: every engine object is garbage. Drop it
+            // now so a later start() rebuilds from scratch.
+            self.audioEngine = AVAudioEngine()
+            self.isRunning = false
+            self.onMediaServicesReset?()
+        }
+    }
+
+    /// True when a PCM buffer arrived within `window` seconds — i.e. the
+    /// engine is genuinely delivering audio, not just claiming to run.
+    func hasRecentBuffers(within window: TimeInterval) -> Bool {
+        Date().timeIntervalSince(lastBufferAt) < window
     }
 
     // MARK: - Capture control
@@ -232,10 +273,20 @@ final class AudioCaptureService {
     }
 
     /// Stops the engine and removes the tap without touching the session
-    /// (used between failed attempts).
+    /// (used between failed attempts). Exception-safe: removing a tap from
+    /// a broken engine can raise an NSException.
     private func teardownEngine() {
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
+        var exceptionReason: NSString?
+        ObjCExceptionCatcher.catchException({
+            self.audioEngine.inputNode.removeTap(onBus: 0)
+            self.audioEngine.stop()
+        }, outExceptionReason: &exceptionReason)
+        if let exceptionReason {
+            Self.logger.warning("teardownEngine raised: \(String(exceptionReason)) — recreating engine")
+        }
+        // Always hand back a FRESH engine so the next start never touches a
+        // broken one.
+        audioEngine = AVAudioEngine()
     }
 
     private static func floatFormat(rate: Double, channels: AVAudioChannelCount) -> AVAudioFormat? {
@@ -280,6 +331,7 @@ final class AudioCaptureService {
     // MARK: - Buffer handling
 
     private func handle(buffer: AVAudioPCMBuffer) {
+        lastBufferAt = Date()
         onBuffer?(buffer)
 
         // Throttle level updates so we don't flood the main queue.

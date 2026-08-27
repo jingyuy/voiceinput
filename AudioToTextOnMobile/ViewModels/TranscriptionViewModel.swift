@@ -3,8 +3,12 @@ import Foundation
 import Observation
 import Speech
 
-/// The app's main state container: orchestrates microphone capture and
-/// on-device speech recognition, and exposes everything the UI needs.
+/// The app's main state container. It drives a session through the shared
+/// `KeyboardDictationCoordinator` — the SINGLE owner of capture + recognition —
+/// so the process never runs two audio engines. A second `AVAudioEngine`
+/// sharing the `AVAudioSession` deactivates the always-armed engine and
+/// silently breaks background dictation until a restart, so the app's own UI
+/// must ride the same engine the keyboard uses.
 @MainActor
 @Observable
 final class TranscriptionViewModel {
@@ -21,25 +25,35 @@ final class TranscriptionViewModel {
 
     // MARK: - Published state
 
-    private(set) var state: RecordingState = .idle
-    private(set) var liveTranscript = ""
-    private(set) var finalizedSegments: [String] = []
-    private(set) var audioLevel: Float = 0
     private(set) var isOnDevice = true
 
-    // MARK: - Services
-
-    private let captureService: AudioCaptureService
-    private let speechService: SpeechRecognitionService
-    private var smoothedLevel: Float = 0
+    private let coordinator = KeyboardDictationCoordinator.shared
 
     // MARK: - Init
 
-    init(locale: Locale = Locale(identifier: "en-US")) {
-        captureService = AudioCaptureService()
-        speechService = SpeechRecognitionService(locale: locale)
-        isOnDevice = speechService.supportsOnDevice
-        wireCallbacks()
+    init() {
+        // supportsOnDevice is computed from the recognizer at init; a
+        // throwaway instance is safe (no session is started on it).
+        isOnDevice = SpeechRecognitionService(locale: Locale(identifier: "en-US")).supportsOnDevice
+    }
+
+    // MARK: - Session state (bound to the coordinator)
+
+    var liveTranscript: String { coordinator.liveText }
+    var finalizedSegments: [String] { coordinator.finalizedSegments }
+    var audioLevel: Float { coordinator.audioLevel }
+
+    /// Transient "asking the system for permission" indicator.
+    private var isStarting = false
+
+    var state: RecordingState {
+        if isStarting { return .requestingPermission }
+        switch coordinator.status {
+        case .recording: return .recording
+        case .failed: return .failed(coordinator.errorMessage ?? "Dictation failed.")
+        case .ready, .transcribing: return .ready
+        case .idle, .requested: return .idle
+        }
     }
 
     // MARK: - User actions
@@ -51,108 +65,36 @@ final class TranscriptionViewModel {
             stopRecording()
         case .requestingPermission:
             break
-        case .failed:
-            state = .idle
-            startRecording()
-        default:
+        case .failed, .idle, .ready:
             startRecording()
         }
     }
 
     /// Stops recording and clears the transcript history.
     func clearSession() {
-        if state == .recording {
-            stopRecording()
+        if coordinator.isAppSession {
+            coordinator.stopAppSession()
         }
-        finalizedSegments = []
-        liveTranscript = ""
-        audioLevel = 0
-        smoothedLevel = 0
-        state = .ready
+        coordinator.clearAppTranscript()
     }
 
     // MARK: - Recording
 
     private func startRecording() {
-        state = .requestingPermission
+        guard coordinator.canStartAppSession else { return }
+        isStarting = true
+        coordinator.startAppSession()
+        // startAppSession sets the status synchronously; the async permission
+        // + engine start resolves within a moment. Give it a beat before
+        // clearing the "requesting permission" indicator.
         Task {
-            await beginRecording()
-        }
-    }
-
-    private func beginRecording() async {
-        do {
-            let micGranted = await Self.requestMicrophonePermission()
-            let speechGranted = await Self.requestSpeechPermission()
-
-            guard micGranted && speechGranted else {
-                state = .failed("Microphone or speech recognition access was denied. You can enable both in Settings → Privacy.")
-                return
-            }
-
-            try speechService.startSession()
-            try captureService.start()
-
-            liveTranscript = ""
-            state = .recording
-        } catch {
-            speechService.cancelSession()
-            captureService.stop()
-            state = .failed(error.localizedDescription)
+            try? await Task.sleep(for: .seconds(0.6))
+            isStarting = false
         }
     }
 
     private func stopRecording() {
-        guard state == .recording else { return }
-        captureService.stop()
-        speechService.finishSession()
-        state = .ready
-    }
-
-    // MARK: - Service wiring
-
-    private func wireCallbacks() {
-        speechService.onTranscriptUpdate = { [weak self] text in
-            self?.liveTranscript = text
-        }
-        speechService.onSegmentFinalized = { [weak self] text in
-            guard let self else { return }
-            self.finalizedSegments.append(text)
-            self.liveTranscript = ""
-        }
-        speechService.onError = { [weak self] message in
-            guard let self else { return }
-            self.captureService.stop()
-            self.speechService.cancelSession()
-            self.liveTranscript = ""
-            self.state = .failed(message)
-        }
-        captureService.onBuffer = { [weak self] buffer in
-            self?.speechService.append(buffer)
-        }
-        captureService.onLevel = { [weak self] level in
-            guard let self else { return }
-            // Attack/release smoothing for a lively waveform.
-            let attack: Float = level > self.smoothedLevel ? 0.55 : 0.2
-            self.smoothedLevel += (level - self.smoothedLevel) * attack
-            self.audioLevel = self.smoothedLevel
-        }
-        captureService.onInterruption = { [weak self] in
-            self?.stopRecording()
-        }
-    }
-
-    // MARK: - Permissions
-
-    private static func requestMicrophonePermission() async -> Bool {
-        await withCheckedContinuation { continuation in
-            AVAudioApplication.requestRecordPermission { granted in
-                continuation.resume(returning: granted)
-            }
-        }
-    }
-
-    private static func requestSpeechPermission() async -> Bool {
-        await SpeechRecognitionService.requestAuthorization()
+        guard coordinator.isAppSession else { return }
+        coordinator.stopAppSession()
     }
 }

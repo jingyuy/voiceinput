@@ -73,8 +73,58 @@ flowchart LR
 | `.failed` | app | `errorMessage` published → keyboard shows it |
 
 Keyboard → app controls: `stopRequested` / `cancelRequested` booleans + Darwin
-ping. Heartbeats (`lastActivity`) tell the keyboard the app is alive so it
-**never cold-launches** a live app (which would steal the foreground).
+ping. Liveness is `appHeartbeat` (written ONLY by the app — armed engine,
+session loop, ping): the keyboard uses its **freshness** to decide
+Darwin-wake (4 s) vs cold-launch (1.5 s), and detects app death fast (stale
+> 8 s → fail immediately instead of hanging). `lastActivity` is protocol/
+speech activity (idle timeouts); `readyAt` is the timestamp of `.ready` —
+the 10-minute surprise-insert gate.
+
+### IPC keys
+
+| Key | Writer | Meaning |
+|---|---|---|
+| `status` | both | state machine (`idle`/`requested`/`recording`/`transcribing`/`ready`/`failed`) |
+| `sessionToken` | keyboard | UUID identifying the request |
+| `liveText` / `audioLevel` | app | streaming partial transcript + mic level |
+| `finalText` | app | final result (keyboard clears after inserting) |
+| `errorMessage` | app | failure text (keyboard clears after showing) |
+| `stopRequested` / `cancelRequested` | keyboard | boolean controls + ping |
+| `lastActivity` | both | speech/protocol activity (idle timeouts, stale-request age) |
+| `appHeartbeat` | **app only** | liveness; fresh = alive AND can serve in background |
+| `readyAt` | app | when `.ready` was published (freshness gate for auto-insert) |
+| `isColdStart` | app | unused legacy flag |
+
+### Stability design (the app's lifecycle vs the keyboard)
+
+The whole scheme depends on the app being alive **with the mic armed**.
+That lifecycle has holes — iOS kills background apps, interruptions and
+route changes and mediaserverd resets steal the input unit, and the app
+cannot re-arm from the background (`'!int'` 560557684). The design closes
+each hole:
+
+1. **One engine, one recognizer, one process.** The app's own UI
+   (TranscriptionView) drives sessions through the same
+   `KeyboardDictationCoordinator` — a second `AVAudioEngine` sharing the
+   session deactivates the armed one and silently breaks background
+   dictation until a restart. `isAppSession` sessions never write the
+   shared keyboard protocol.
+2. **Engine-death recovery.** The arm-watcher (every 5 s) force-re-arms an
+   engine that claims to run but delivered no buffers for 10 s (session
+   stolen). Interruption-ended, route change and media-services-reset all
+   force a clean teardown + re-arm (interruption-ended is the one case iOS
+   permits a background re-arm).
+3. **Honest heartbeat.** The app only claims liveness when it can actually
+   serve (`isActive || engine running`). A dead/unarmed app goes silent, so
+   the keyboard cold-launches it fast instead of waiting on a stale signal.
+4. **Fast app-death detection.** While `.recording`/`.transcribing`, the
+   keyboard fails within ~8 s of the heartbeat going stale (app force-quit)
+   instead of hanging 55 s.
+5. **Orphan-session adoption.** If the app is killed mid-session, the next
+   cold-launch re-adopts shared `.recording`/`.transcribing` (restarting
+   audio in the foreground) and surfaces a dangling `.ready` overlay.
+6. **An empty dictation keeps the engine armed** — an empty result never
+   costs a cold-launch on the next attempt.
 
 ### IPC stack
 
