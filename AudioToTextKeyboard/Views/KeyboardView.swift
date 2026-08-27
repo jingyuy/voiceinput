@@ -34,7 +34,7 @@ struct KeyboardView: View {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.orange)
-                    .lineLimit(2)
+                    .lineLimit(3)
             } else if case .starting = state.phase {
                 HStack(spacing: 6) {
                     ProgressView()

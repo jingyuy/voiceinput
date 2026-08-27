@@ -1,6 +1,8 @@
 import AVFoundation
 import Foundation
+import os
 import Speech
+import UIKit
 
 /// Errors surfaced by `SpeechRecognitionService`.
 enum SpeechRecognitionError: LocalizedError {
@@ -27,6 +29,11 @@ enum SpeechRecognitionError: LocalizedError {
 /// - All callbacks are delivered on the main queue.
 /// - Recognition runs entirely on the device — no audio ever leaves it.
 final class SpeechRecognitionService {
+
+    private static let logger = Logger(
+        subsystem: "com.example.AudioToTextOnMobile.shared",
+        category: "SpeechRecognition"
+    )
 
     // MARK: - Callbacks (all on the main queue)
 
@@ -68,12 +75,15 @@ final class SpeechRecognitionService {
     /// cannot run right now.
     func startSession() throws {
         guard let recognizer else {
+            Self.logger.error("startSession: recognizer is nil (locale en-US unsupported?)")
             throw SpeechRecognitionError.notSupported
         }
         guard recognizer.isAvailable else {
+            Self.logger.error("startSession: recognizer unavailable isAvailable=false")
             throw SpeechRecognitionError.busyOrUnavailable
         }
         guard recognizer.supportsOnDeviceRecognition else {
+            Self.logger.error("startSession: on-device recognition unsupported")
             throw SpeechRecognitionError.onDeviceUnavailable
         }
 
@@ -114,7 +124,8 @@ final class SpeechRecognitionService {
                         self.isCancelling = false
                         return
                     }
-                    self.onError?(error.localizedDescription)
+                    Self.logger.error("recognitionTask error: \(Self.errorDetail(error))")
+                    self.onError?(SpeechRecognitionService.errorDetail(error))
                     self.recognitionRequest = nil
                     self.recognitionTask = nil
                 }
@@ -144,6 +155,25 @@ final class SpeechRecognitionService {
         recognitionTask?.cancel()
         recognitionRequest = nil
         recognitionTask = nil
+    }
+
+    /// Walks the NSError chain to the deepest cause and returns a compact
+    /// "domain code" string. The full chain goes to the pasteboard too.
+    static func errorDetail(_ error: Error) -> String {
+        var chain: [NSError] = []
+        var ns = error as NSError
+        chain.append(ns)
+        while let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError,
+              underlying !== ns {
+            chain.append(underlying)
+            ns = underlying
+        }
+        let deepest = chain.last!
+        let full = chain
+            .map { "\($0.domain) code=\($0.code): \($0.localizedDescription)" }
+            .joined(separator: "\n")
+        UIPasteboard.general.string = full
+        return "\(deepest.domain) code=\(deepest.code)"
     }
 
     // MARK: - Authorization

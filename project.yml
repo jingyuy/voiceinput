@@ -14,12 +14,23 @@ targets:
     dependencies:
       - target: AudioToTextKeyboard
         embed: true
+    entitlements:
+      path: AudioToTextOnMobile/AudioToTextOnMobile.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.example.AudioToTextOnMobile
     info:
       path: AudioToTextOnMobile/Info.plist
       properties:
         CFBundleDisplayName: "Audio To Text"
         NSMicrophoneUsageDescription: "This app uses the microphone to capture your speech and transcribe it to text in real time."
         NSSpeechRecognitionUsageDescription: "Speech recognition converts your spoken words into text. Everything runs locally on your device — no audio is uploaded."
+        CFBundleURLTypes:
+          - CFBundleURLName: com.example.AudioToTextOnMobile
+            CFBundleURLSchemes:
+              - attotext
+        UIBackgroundModes:
+          - audio
         UILaunchScreen: {}
         UIUserInterfaceStyle: Dark
         UISupportedInterfaceOrientations:
@@ -47,6 +58,7 @@ targets:
         DEVELOPMENT_TEAM: 57KNZSYU47
         ENABLE_PREVIEWS: YES
         SUPPORTS_MACCATALYST: NO
+        SWIFT_OBJC_BRIDGING_HEADER: Shared/Shared-Bridging-Header.h
 
   AudioToTextKeyboard:
     type: app-extension
@@ -54,6 +66,11 @@ targets:
     sources:
       - path: AudioToTextKeyboard
       - path: Shared
+    entitlements:
+      path: AudioToTextKeyboard/AudioToTextKeyboard.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.example.AudioToTextOnMobile
     info:
       path: AudioToTextKeyboard/Info.plist
       properties:
@@ -80,6 +97,7 @@ targets:
         APPLICATION_EXTENSION_API_ONLY: YES
         SKIP_INSTALL: YES
         ENABLE_PREVIEWS: YES
+        SWIFT_OBJC_BRIDGING_HEADER: Shared/Shared-Bridging-Header.h
 
 schemes:
   AudioToTextOnMobile:
