@@ -23,20 +23,13 @@ struct KeyboardView: View {
     private var statusArea: some View {
         Group {
             if !state.hasFullAccess {
-                Button {
-                    // Open the container app, which can host instructions for
-                    // enabling Full Access (Settings → General → Keyboard).
-                    state.openURLHandler?(DictationURL.settings)
-                } label: {
-                    Label("Full Access is off — tap to learn how to enable it.",
-                          systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(Capsule().fill(.orange.opacity(0.12)))
-                }
-                .buttonStyle(.plain)
+                Label("Full Access is off — enable it in Settings → General → Keyboard.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Capsule().fill(.orange.opacity(0.12)))
             } else if case .failed(let message) = state.phase {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2.weight(.medium))

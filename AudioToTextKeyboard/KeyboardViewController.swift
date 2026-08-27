@@ -47,10 +47,14 @@ final class KeyboardViewController: UIInputViewController {
         // reasons (host-app switches, keyboard re-presentation), and a live
         // dictation session must survive them.
         keyboardState?.refreshFullAccessStatus()
-        // Re-attach to a session the container app is still running, or
-        // insert text the app finalized while this keyboard process was
-        // suspended/killed (cold launch, then swipe back to the host app).
-        keyboardState?.recoverKeyboardSession()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // The keyboard is going away (host app switched, keyboard dismissed,
+        // another keyboard selected). Stop recording and discard the session
+        // — we never insert text after the keyboard is no longer visible.
+        keyboardState?.cancelDictation()
     }
 
     // MARK: - Actions (called from SwiftUI)

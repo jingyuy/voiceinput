@@ -32,17 +32,6 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleURLTypes:
-          - CFBundleURLName: com.example.AudioToTextOnMobile
-            CFBundleURLSchemes:
-              - attotext
-        UIBackgroundModes:
-          - audio
-    entitlements:
-      path: AudioToTextOnMobile/AudioToTextOnMobile.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.example.AudioToTextOnMobile
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.AudioToTextOnMobile
@@ -69,17 +58,14 @@ targets:
       path: AudioToTextKeyboard/Info.plist
       properties:
         CFBundleDisplayName: "Audio To Text"
+        NSMicrophoneUsageDescription: "The keyboard uses the microphone to capture your speech and transcribe it to text. Requires Full Access."
+        NSSpeechRecognitionUsageDescription: "Speech recognition converts your spoken words into text. Everything runs locally on your device — no audio is uploaded."
         NSExtension:
           NSExtensionAttributes:
             RequestsOpenAccess: true
             PrimaryLanguage: en-US
           NSExtensionPointIdentifier: com.apple.keyboard-service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardViewController
-    entitlements:
-      path: AudioToTextKeyboard/AudioToTextKeyboard.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.example.AudioToTextOnMobile
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.AudioToTextOnMobile.Keyboard

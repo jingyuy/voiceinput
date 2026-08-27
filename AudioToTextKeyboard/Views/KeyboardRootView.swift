@@ -1,11 +1,9 @@
 import SwiftUI
 
 /// Top-level keyboard view: swaps between the idle layout and the
-/// recording overlay, and injects the `openURL` action into `KeyboardState`
-/// for cold-launching the container app.
+/// recording overlay.
 struct KeyboardRootView: View {
     @ObservedObject var state: KeyboardState
-    @Environment(\.openURL) private var openURL
 
     var body: some View {
         ZStack {
@@ -22,9 +20,6 @@ struct KeyboardRootView: View {
             }
             .padding(.top, 4)
             .padding(.bottom, 8)
-        }
-        .onAppear {
-            state.openURLHandler = { url in openURL(url) }
         }
     }
 }

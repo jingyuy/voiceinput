@@ -276,3 +276,20 @@ flowchart LR
 - [`getdictus/dictus-ios`](https://github.com/getdictus/dictus-ios) — reference implementation +
   `13-cold-start-audio-bridge` research/verification docs
 - Apple Developer Forums #742601 (mic in keyboard), #821235 (dictation gap)
+
+---
+
+## Architecture update (2026-08-27)
+
+The design above was implemented and then REVISED after device testing:
+
+**Problem:** the container-app IPC approach was unreliable — the keyboard posts a Darwin notification, but a suspended container app can't receive it, so dictation failed with "Dictation isn't connected" unless the app was in its brief post-background grace period. There is no API to wake a suspended app with a Darwin notification.
+
+**New architecture (current):** the keyboard extension is fully self-contained.
+
+- The keyboard records audio itself and runs on-device speech recognition **in its own process** (this is what Gboard/SwiftKey do). Full Access (already required) grants the keyboard the microphone.
+- `AudioCaptureService` + `SpeechRecognitionService` moved to `Shared/` so both the app and the keyboard compile them.
+- `KeyboardState` now owns the session directly (permissions → capture → recognition → insert into `textDocumentProxy`). The recording overlay already existed in the keyboard UI.
+- The container app is NOT involved in dictation. `KeyboardDictationCoordinator`, `KeyboardReturnOverlayView`, `AppGroup`, `DarwinNotifications`, `DictationSharedState`, the App Group entitlements, the `attotext://` URL scheme, and `UIBackgroundModes: audio` were all removed.
+- Added `NSMicrophoneUsageDescription` + `NSSpeechRecognitionUsageDescription` to the keyboard's Info.plist (required for mic + speech in the extension).
+- Session is cancelled cleanly when the keyboard is dismissed (`viewWillDisappear`).

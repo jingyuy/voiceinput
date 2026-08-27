@@ -34,5 +34,9 @@
 		<key>NSExtensionPrincipalClass</key>
 		<string>$(PRODUCT_MODULE_NAME).KeyboardViewController</string>
 	</dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>The keyboard uses the microphone to capture your speech and transcribe it to text. Requires Full Access.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Speech recognition converts your spoken words into text. Everything runs locally on your device — no audio is uploaded.</string>
 </dict>
 </plist>
