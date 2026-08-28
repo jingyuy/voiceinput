@@ -38,6 +38,13 @@ final class KeyboardState: ObservableObject {
     @Published var audioLevel: Float = 0
     @Published var elapsed: TimeInterval = 0
     @Published var hasFullAccess = false
+    /// The final text of the last completed session. Kept so the overlay can
+    /// offer a manual "Insert" when an auto-insert couldn't be verified.
+    @Published var finalText = ""
+    /// True when the last auto-insert could not be verified against the
+    /// document — the overlay shows a manual insert button as a fallback so
+    /// text that was seen is never lost.
+    @Published var needsManualInsert = false
 
     /// Injected by the SwiftUI layer (`KeyboardRootView`). SwiftUI's
     /// `openURL` is the ONLY way a keyboard extension can reliably open a
@@ -58,6 +65,16 @@ final class KeyboardState: ObservableObject {
     private var insertedFinalText = false
     private var lastLiveText = ""
     private var lastActivityDate: Date?
+    /// True while the keyboard is on screen. Inserts are only attempted when
+    /// visible — a `.ready` polled during the dismissal transition would
+    /// otherwise insert into a detached input session and lose the text.
+    private var isVisible = false
+    /// True when the app was alive (fresh heartbeat) when `startDictation`
+    /// ran. If the keyboard is then dismissed before the app acknowledged,
+    /// the request is abandoned on purpose (the app discards it). When the
+    /// app was dead, dismissal is usually the cold-launch handoff — the
+    /// request must survive so the app can adopt it on launch.
+    private var appWasAliveAtStart = false
 
     // MARK: - Timings
 
@@ -133,6 +150,8 @@ final class KeyboardState: ObservableObject {
         sessionGeneration += 1
         let generation = sessionGeneration
         insertedFinalText = false
+        finalText = ""
+        needsManualInsert = false
         phase = .starting
         liveTranscript = ""
         audioLevel = 0
@@ -141,6 +160,7 @@ final class KeyboardState: ObservableObject {
         // Snapshot liveness BEFORE reset() — reset wipes the heartbeat key,
         // and the app (if alive) only re-touches it after the ping lands.
         let delay = effectiveColdLaunchDelay
+        appWasAliveAtStart = appIsAlive
         // Fresh request: token + .requested, then wake the app.
         myToken = UUID().uuidString
         let defaults = AppGroup.defaults
@@ -191,13 +211,10 @@ final class KeyboardState: ObservableObject {
                     let text = DictationSharedState.finalText(defaults)
                     if !text.isEmpty {
                         self.insertedFinalText = true
-                        self.controller?.insertText(text)
-                        DictationSharedState.clearFinalResult(defaults: defaults)
-                        DictationSharedState.setStatus(.idle, defaults: defaults)
-                        Self.logger.info("stopDictation watchdog: late .ready — inserted final text")
-                        self.phase = .ready
-                        self.liveTranscript = ""
-                        self.scheduleIdle(after: 1.5)
+                        self.finalText = text
+                        self.needsManualInsert = false
+                        Self.logger.info("stopDictation watchdog: late .ready — inserting final text")
+                        self.insertAndVerify(text)
                         return
                     }
                 }
@@ -222,22 +239,49 @@ final class KeyboardState: ObservableObject {
             defaults.set(true, forKey: DictationSharedState.Key.cancelRequested)
             DictationSharedState.touchActivity(defaults: defaults)
             DarwinNotifications.post()
+        } else if current == .ready {
+            // The user cancelled from the "insert" overlay — drop the
+            // pending result so it can't surprise-insert later.
+            DictationSharedState.clearFinalResult(defaults: defaults)
+            DictationSharedState.setStatus(.idle, defaults: defaults)
         }
         resetToIdle()
     }
 
+    /// Called from `viewWillAppear`.
+    func keyboardDidAppear() {
+        isVisible = true
+    }
+
+    /// Called from `viewWillDisappear`.
+    func keyboardWillDisappear() {
+        isVisible = false
+    }
+
     /// Called from `viewWillDisappear`. A LIVE session lives in the app and
     /// keeps recording — never touch it here. A `.starting` request is LEFT
-    /// in the shared store: if the app was suspended (cold-launch race) it
-    /// must still be able to adopt it when it launches; requests the app
-    /// never picks up expire on its side (`.requested` older than 30s is
-    /// discarded), so they can't dangle into a surprise session.
+    /// in the shared store if the app was dead (cold-launch handoff in
+    /// progress — it must still be able to adopt it when it launches); if
+    /// the app was alive it is cancelled so it can't record into a void.
+    /// Requests the app never picks up expire on its side (`.requested`
+    /// older than 30s is discarded), so they can't dangle into a surprise
+    /// session.
     func cancelPendingRequest() {
         guard phase == .starting else { return }
         sessionGeneration += 1
         watchdogTask?.cancel()
         finishWatchdog?.cancel()
         stopPolling()
+        if appWasAliveAtStart {
+            // The app is alive in the background: it WILL adopt the request,
+            // so tell it the user walked away.
+            let defaults = AppGroup.defaults
+            if DictationSharedState.status(defaults) == .requested {
+                defaults.set(true, forKey: DictationSharedState.Key.cancelRequested)
+                DictationSharedState.touchActivity(defaults: defaults)
+                DarwinNotifications.post()
+            }
+        }
         resetToIdle()
     }
 
@@ -308,13 +352,10 @@ final class KeyboardState: ObservableObject {
             let text = DictationSharedState.finalText(defaults)
             if !text.isEmpty, !insertedFinalText {
                 insertedFinalText = true
-                controller?.insertText(text)
-                DictationSharedState.clearFinalResult(defaults: defaults)
-                DictationSharedState.setStatus(.idle, defaults: defaults)
-                Self.logger.info("recoverKeyboardSession: inserted final text")
-                phase = .ready
-                liveTranscript = ""
-                scheduleIdle(after: 1.5)
+                finalText = text
+                needsManualInsert = false
+                Self.logger.info("recoverKeyboardSession: inserting final text")
+                insertAndVerify(text)
             } else {
                 phase = .idle
             }
@@ -402,18 +443,13 @@ final class KeyboardState: ObservableObject {
                 return
             }
         case .ready:
+            guard isVisible else { return }
             let text = DictationSharedState.finalText(defaults)
             if !text.isEmpty, !insertedFinalText {
                 insertedFinalText = true
-                controller?.insertText(text)
-                // Clear so a respawned keyboard process can't double-insert.
-                DictationSharedState.clearFinalResult(defaults: defaults)
-                DictationSharedState.setStatus(.idle, defaults: defaults)
-                Self.logger.info("pollOnce: inserted final text")
-                phase = .ready
-                liveTranscript = ""
-                stopPolling()
-                scheduleIdle(after: 1.5)
+                finalText = text
+                needsManualInsert = false
+                insertAndVerify(text)
             }
         case .failed:
             let message = DictationSharedState.errorMessage(defaults)
@@ -435,6 +471,63 @@ final class KeyboardState: ObservableObject {
         guard text != lastLiveText else { return }
         lastLiveText = text
         liveTranscript = text
+    }
+
+    // MARK: - Insertion
+
+    /// Inserts the last final text (manual fallback from the overlay when an
+    /// auto-insert could not be verified).
+    func insertFinalText() {
+        let text = finalText
+        guard !text.isEmpty else { return }
+        insertAndVerify(text)
+    }
+
+    /// Inserts `text` and verifies it landed before clearing the shared
+    /// result. The host gets a runloop turn to commit; if the document
+    /// doesn't show the text (field switched away, keyboard dismissed
+    /// mid-insert, stale proxy), the shared result is KEPT and the overlay
+    /// offers a manual "Insert" — text the user already saw must never be
+    /// silently lost to a dropped insert.
+    private func insertAndVerify(_ text: String) {
+        controller?.insertText(text)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.verifyInsert(text) {
+                self.needsManualInsert = false
+                self.consumeReadyResult()
+            } else {
+                Self.logger.warning("insert not verified — keeping text for manual insert")
+                self.needsManualInsert = true
+                self.phase = .ready
+                self.liveTranscript = ""
+                // Polling continues; `insertedFinalText` prevents a re-insert.
+            }
+        }
+    }
+
+    private func verifyInsert(_ text: String) -> Bool {
+        guard isVisible else { return false }
+        guard let controller else { return false }
+        guard let before = controller.textDocumentProxy.documentContextBeforeInput else {
+            // No context to check against (secure field, detached input
+            // session) — assume it landed to avoid duplicate inserts.
+            return true
+        }
+        return before.hasSuffix(text)
+    }
+
+    /// The result was consumed: clear it from the shared store and show the
+    /// brief "Inserted" state before returning to idle.
+    private func consumeReadyResult() {
+        let defaults = AppGroup.defaults
+        DictationSharedState.clearFinalResult(defaults: defaults)
+        DictationSharedState.setStatus(.idle, defaults: defaults)
+        phase = .ready
+        liveTranscript = ""
+        stopPolling()
+        scheduleIdle(after: 1.5)
+        Self.logger.info("final text inserted and verified")
     }
 
     // MARK: - Helpers
@@ -480,6 +573,8 @@ final class KeyboardState: ObservableObject {
         myToken = ""
         lastLiveText = ""
         liveTranscript = ""
+        finalText = ""
+        needsManualInsert = false
         audioLevel = 0
         elapsed = 0
         phase = .idle

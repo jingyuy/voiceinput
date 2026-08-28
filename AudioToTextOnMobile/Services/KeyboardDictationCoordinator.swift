@@ -52,6 +52,9 @@ final class KeyboardDictationCoordinator {
     private var token = ""
     private var isFinishing = false
     private var lastLevelPublish = Date.distantPast
+    /// When the session loop last attempted a mid-session engine re-arm —
+    /// used to escalate a still-stalled engine to finalize-with-partial.
+    private var stallReArmAttemptedAt: Date?
     private var sessionLoopTask: Task<Void, Never>?
     private var finishWatchdog: Task<Void, Never>?
     private var armWatcherTask: Task<Void, Never>?
@@ -186,11 +189,58 @@ final class KeyboardDictationCoordinator {
 
     /// Tears down a broken engine and re-arms it (used when the system took
     /// the mic away: interruption-ended, route change, media services reset).
+    /// Only meaningful while IDLE — during a live session the session-loop
+    /// stall detection owns recovery (see `handleSessionStall`).
     private func forceReArm() {
         if captureService.isRunning {
             captureService.stop()
         }
         ensureMicArmed(force: true)
+    }
+
+    /// The capture engine stopped delivering buffers mid-session (route
+    /// change, media reset, silent session theft). Restart it when we can;
+    /// otherwise finalize so the partial text the user already saw lands in
+    /// the shared store instead of being silently lost.
+    private func handleSessionStall() {
+        guard isActive, status == .recording else { return }
+        let now = Date()
+        if let last = stallReArmAttemptedAt {
+            if now.timeIntervalSince(last) > 2 {
+                Self.logger.warning("session engine still stalled after re-arm — finalizing with partial text")
+                beginFinish()
+            }
+            return
+        }
+        stallReArmAttemptedAt = now
+        if isAppForegroundish {
+            Self.logger.warning("session engine stalled — restarting capture")
+            restartCaptureDuringSession()
+        } else {
+            // In the background a stop+start would deactivate the audio
+            // session and suspend us mid-recovery ('!int' forbids a
+            // background start anyway) — finalize with what we have.
+            Self.logger.warning("session engine stalled in background — finalizing with partial text")
+            beginFinish()
+        }
+    }
+
+    /// Restarts the capture engine while a session is live (the idle guards
+    /// in `ensureMicArmed` must not apply). Recognition keeps consuming the
+    /// new buffers; the old tap's buffers were already lost.
+    private func restartCaptureDuringSession() {
+        if captureService.isRunning {
+            captureService.stop()
+        }
+        Task { @MainActor in
+            guard self.isActive else { return }
+            do {
+                try self.captureService.start()
+                Self.logger.info("capture re-armed during session")
+            } catch {
+                Self.logger.error("session re-arm failed: \(AudioCaptureService.errorDetail(error, copyToPasteboard: false))")
+            }
+        }
     }
 
     /// Watches the armed engine while idle. Detects engines that claim to
@@ -242,6 +292,12 @@ final class KeyboardDictationCoordinator {
             guard isAppForegroundish else { return }
             let token = DictationSharedState.sessionToken(defaults)
             guard !token.isEmpty else { return }
+            if DictationSharedState.wantsCancel(defaults) || DictationSharedState.wantsStop(defaults) {
+                DictationSharedState.reset(defaults: defaults)
+                DictationSharedState.setStatus(.idle, defaults: defaults)
+                Self.logger.info("checkRequested: orphan session was cancelled — discarded")
+                return
+            }
             Self.logger.info("checkRequested: re-adopting orphan \(DictationSharedState.status(defaults).rawValue) session")
             adoptSession(token: token)
         case .ready:
@@ -282,6 +338,17 @@ final class KeyboardDictationCoordinator {
             return
         }
 
+        // The keyboard abandoned this request before we adopted it (it was
+        // dismissed, or stop/cancel was tapped while `.starting`). Never
+        // adopt a session nobody is listening to — it would record into a
+        // void until the idle timeout.
+        if DictationSharedState.wantsCancel(defaults) || DictationSharedState.wantsStop(defaults) {
+            DictationSharedState.reset(defaults: defaults)
+            DictationSharedState.setStatus(.idle, defaults: defaults)
+            Self.logger.info("checkRequested: request cancelled before adoption — discarded")
+            return
+        }
+
         let isForeground = UIApplication.shared.applicationState == .active
         let micGranted = AVAudioApplication.shared.recordPermission == .granted
         let speechGranted = SFSpeechRecognizer.authorizationStatus() == .authorized
@@ -296,10 +363,12 @@ final class KeyboardDictationCoordinator {
     }
 
     private func adoptSession(token: String) {
+        guard !isActive else { return }
         self.token = token
         isActive = true
         isAppSession = false
         isFinishing = false
+        stallReArmAttemptedAt = nil
         finalizedSegments = []
         liveText = ""
         finalText = ""
@@ -328,6 +397,7 @@ final class KeyboardDictationCoordinator {
         isActive = true
         isAppSession = true
         isFinishing = false
+        stallReArmAttemptedAt = nil
         finalizedSegments = []
         liveText = ""
         finalText = ""
@@ -400,7 +470,15 @@ final class KeyboardDictationCoordinator {
     private func startAudio() async {
         let micGranted = await Self.requestMicrophonePermission()
         let speechGranted = await Self.requestSpeechPermission()
+        // A stop/cancel may have raced the permission prompts (first use).
         guard isActive else { return }  // cancelled while the prompt was up
+        guard !isFinishing else {
+            // The user asked to stop while the prompt was still up — finalize
+            // immediately with whatever text we already have instead of
+            // starting a session nobody is listening to.
+            finishAndPublish()
+            return
+        }
         guard micGranted && speechGranted else {
             publishFailure("Microphone or speech recognition access was denied. Enable both in Settings → Privacy, then try again.")
             return
@@ -589,11 +667,18 @@ final class KeyboardDictationCoordinator {
                 cancelSession()
             } else if DictationSharedState.wantsStop(defaults) {
                 beginFinish()
-            } else if let last = DictationSharedState.lastActivityDate,
-                      Date().timeIntervalSince(last) > 60 {
-                // No speech for a minute (keyboard may be dead) — finalize.
-                Self.logger.info("dictation idle 60s — auto-finalizing")
-                beginFinish()
+            } else if captureService.isRunning, !captureService.hasRecentBuffers(within: 3) {
+                // The engine claims to run but stopped delivering audio
+                // (interruption, route change, media reset, stolen session).
+                handleSessionStall()
+            } else {
+                stallReArmAttemptedAt = nil
+                if let last = DictationSharedState.lastActivityDate,
+                   Date().timeIntervalSince(last) > 60 {
+                    // No speech for a minute (keyboard may be dead) — finalize.
+                    Self.logger.info("dictation idle 60s — auto-finalizing")
+                    beginFinish()
+                }
             }
         case .transcribing, .ready, .requested, .failed:
             break
@@ -679,15 +764,23 @@ final class KeyboardDictationCoordinator {
         }
         captureService.onInterruptionEnded = { [weak self] in
             // The system gave the mic back. The engine may be stale-dead
-            // with isRunning stuck true — force a clean re-arm.
-            self?.forceReArm()
+            // with isRunning stuck true — force a clean re-arm. During a
+            // live session recovery is owned by the session-loop stall
+            // detection: a stop+start here could deactivate the audio
+            // session and suspend a backgrounded app mid-finalize.
+            guard let self, !self.isActive else { return }
+            self.forceReArm()
         }
         captureService.onRouteChanged = { [weak self] in
             guard let self, !self.isActive else { return }
             self.forceReArm()
         }
         captureService.onMediaServicesReset = { [weak self] in
-            self?.forceReArm()
+            // mediaserverd died: the engine object is already swapped by
+            // AudioCaptureService. During a session the stall detection
+            // restarts capture; while idle we re-arm directly.
+            guard let self, !self.isActive else { return }
+            self.forceReArm()
         }
     }
 
@@ -726,6 +819,7 @@ final class KeyboardDictationCoordinator {
     private func standDown() {
         stopSessionLoop()
         finishWatchdog?.cancel()
+        stallReArmAttemptedAt = nil
         isActive = false
         isAppSession = false
         isFinishing = false

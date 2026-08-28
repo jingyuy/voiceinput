@@ -47,7 +47,7 @@ struct RecordingOverlayView: View {
         switch state.phase {
         case .recording: return "Listening"
         case .transcribing: return "Finalizing…"
-        case .ready: return "Inserted"
+        case .ready: return state.needsManualInsert ? "Tap to insert" : "Inserted"
         default: return "Dictating"
         }
     }
@@ -56,12 +56,27 @@ struct RecordingOverlayView: View {
 
     private var transcript: some View {
         ScrollView {
-            Text(state.liveTranscript.isEmpty ? "Speak now…" : state.liveTranscript)
+            Text(displayText)
                 .font(.body.weight(.medium))
-                .foregroundStyle(state.liveTranscript.isEmpty ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                .foregroundStyle(isTextPlaceholder ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxHeight: 64)
+    }
+
+    private var displayText: String {
+        switch state.phase {
+        case .ready:
+            // Show the final text so a failed auto-insert can always be
+            // recovered by hand — never vanish silently.
+            return state.finalText.isEmpty ? "Speak now…" : state.finalText
+        default:
+            return state.liveTranscript.isEmpty ? "Speak now…" : state.liveTranscript
+        }
+    }
+
+    private var isTextPlaceholder: Bool {
+        displayText == "Speak now…"
     }
 
     // MARK: - Controls
@@ -76,14 +91,28 @@ struct RecordingOverlayView: View {
                     .frame(width: 46, height: 46)
                     .background(Circle().fill(.white.opacity(0.1)))
             }
-            Button {
-                state.stopDictation()
-            } label: {
-                Image(systemName: "stop.fill")
-                    .font(.title2.weight(.bold))
-                    .frame(width: 56, height: 56)
-                    .background(Circle().fill(Color.red.opacity(0.85)))
-                    .shadow(color: .red.opacity(0.5), radius: 10)
+            if state.phase == .ready {
+                if state.needsManualInsert {
+                    Button {
+                        state.insertFinalText()
+                    } label: {
+                        Label("Insert", systemImage: "text.cursor")
+                            .font(.headline)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 12)
+                            .background(Capsule().fill(Color.teal))
+                    }
+                }
+            } else {
+                Button {
+                    state.stopDictation()
+                } label: {
+                    Image(systemName: "stop.fill")
+                        .font(.title2.weight(.bold))
+                        .frame(width: 56, height: 56)
+                        .background(Circle().fill(Color.red.opacity(0.85)))
+                        .shadow(color: .red.opacity(0.5), radius: 10)
+                }
             }
         }
         .foregroundStyle(.white)

@@ -43,6 +43,7 @@ final class KeyboardViewController: UIInputViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        keyboardState?.keyboardDidAppear()
         // The keyboard process may have been suspended/killed while the app
         // was foreground (cold launch). Re-attach to the live session or
         // insert immediately if it already finished.
@@ -55,6 +56,7 @@ final class KeyboardViewController: UIInputViewController {
         // app (which keeps recording in the background) — do NOT cancel it;
         // it resumes via `recoverKeyboardSession` on return. Only a request
         // that was never picked up is abandoned here so it can't dangle.
+        keyboardState?.keyboardWillDisappear()
         keyboardState?.cancelPendingRequest()
     }
 
