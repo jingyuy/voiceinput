@@ -84,12 +84,12 @@ struct KeyboardView: View {
 
     private var bottomRow: some View {
         HStack(spacing: 10) {
-            keyButton(systemName: "globe", action: { state.switchToNextKeyboard() })
-                .frame(width: 60)
             keyButton(systemName: "space", action: { state.insertText(" ") })
                 .frame(maxWidth: .infinity)
+            keyButton(systemName: "return", action: { state.insertText("\n") })
+                .frame(width: 72)
             keyButton(systemName: "delete.left", action: { state.deleteBackward() })
-                .frame(width: 60)
+                .frame(width: 56)
         }
         .frame(height: 46)
     }

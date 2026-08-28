@@ -379,10 +379,6 @@ final class KeyboardState: ObservableObject {
         controller?.deleteBackward()
     }
 
-    func switchToNextKeyboard() {
-        controller?.switchToNextInputMode()
-    }
-
     // MARK: - Polling
 
     private func startPolling(generation: Int) {

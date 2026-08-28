@@ -69,8 +69,4 @@ final class KeyboardViewController: UIInputViewController {
     func deleteBackward() {
         textDocumentProxy.deleteBackward()
     }
-
-    func switchToNextInputMode() {
-        advanceToNextInputMode()
-    }
 }
