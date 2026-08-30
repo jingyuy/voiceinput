@@ -382,9 +382,12 @@ final class KeyboardDictationCoordinator {
 
     // MARK: - App-side sessions (the app's own UI)
 
-    /// True when the app's own record button can start a session.
+    /// True when the app's own record button can start a session. `.ready`
+    /// is allowed as a defensive catch: a session that ended while the app
+    /// was backgrounded (keyboard inserted, or result dismissed) leaves a
+    /// stale status behind, and the mic must still start a NEW session.
     var canStartAppSession: Bool {
-        !isActive && (status == .idle || status == .failed)
+        !isActive && (status == .idle || status == .failed || status == .ready)
     }
 
     /// Starts a session driven by the app's own UI (TranscriptionView).
@@ -458,10 +461,13 @@ final class KeyboardDictationCoordinator {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         finalizedSegments = text.isEmpty ? [] : [text]
         liveText = ""
-        status = .ready
+        status = .idle
         isActive = false
         isAppSession = false
         stopSessionLoop()
+        if !text.isEmpty {
+            TranscriptionHistoryStore.shared.add(text)
+        }
         // The capture engine stays armed for the keyboard.
     }
 
@@ -577,6 +583,7 @@ final class KeyboardDictationCoordinator {
         }
         finalText = text
         status = .ready
+        TranscriptionHistoryStore.shared.add(text)
         DictationSharedState.clearPayload(defaults: defaults)
         DictationSharedState.setStatus(.ready, defaults: defaults)
         defaults.set(text, forKey: DictationSharedState.Key.finalText)
@@ -618,7 +625,8 @@ final class KeyboardDictationCoordinator {
         DictationSharedState.clearPayload(defaults: defaults)
         DictationSharedState.setStatus(.failed, defaults: defaults)
         defaults.set(message, forKey: DictationSharedState.Key.errorMessage)
-        standDown()
+        // Keep `.failed` so the main screen shows the error banner.
+        standDown(resetStatus: false)
         // Copy the error to the pasteboard so the user can paste it back to
         // the developer without typing it.
         let dump = """
@@ -816,7 +824,10 @@ final class KeyboardDictationCoordinator {
         UIApplication.shared.applicationState != .background
     }
 
-    private func standDown() {
+    /// Ends a session and clears session state. By default the status is
+    /// reset to `.idle` so the main screen's record button is usable again;
+    /// failure paths pass `resetStatus: false` to keep `.failed` visible.
+    private func standDown(resetStatus: Bool = true) {
         stopSessionLoop()
         finishWatchdog?.cancel()
         stallReArmAttemptedAt = nil
@@ -829,6 +840,9 @@ final class KeyboardDictationCoordinator {
         liveText = ""
         finalText = ""
         errorMessage = nil
+        if resetStatus {
+            status = .idle
+        }
     }
 
     // MARK: - Permissions

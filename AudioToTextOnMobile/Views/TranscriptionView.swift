@@ -2,25 +2,112 @@ import SwiftUI
 import UIKit
 
 /// The main screen: live waveform, streaming transcript, and record control.
+/// When a keyboard-driven session is live, this same screen shows it
+/// (recording state, live text, stop/cancel) — the app has no separate
+/// dictation overlay anymore.
 struct TranscriptionView: View {
     @State private var viewModel = TranscriptionViewModel()
+    @State private var historyStore = TranscriptionHistoryStore.shared
+    @State private var confirmClearHistory = false
+
+    private enum MainSection: Hashable {
+        case dictate
+        case history
+    }
+
+    @State private var section: MainSection = .dictate
 
     var body: some View {
         ZStack {
             BackgroundView()
-            VStack(spacing: 18) {
+            VStack(spacing: 14) {
                 header
-                waveformCard
-                errorBanner
-                transcriptCard
-                Spacer(minLength: 0)
-                recordSection
+                sectionPicker
+                Group {
+                    if section == .dictate {
+                        dictateSection
+                    } else {
+                        historySection
+                    }
+                }
             }
             .padding(.horizontal, 20)
             .padding(.top, 12)
             .padding(.bottom, 32)
         }
         .preferredColorScheme(.dark)
+        .onChange(of: viewModel.isKeyboardSession) {
+            // A keyboard session (e.g. a cold launch) must be visible —
+            // jump back to the Dictate tab so the live recording shows.
+            if viewModel.isKeyboardSession {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    section = .dictate
+                }
+            }
+        }
+    }
+
+    // MARK: - Section picker
+
+    private var sectionPicker: some View {
+        Picker("Section", selection: $section) {
+            Text("Dictate").tag(MainSection.dictate)
+            Text("History").tag(MainSection.history)
+        }
+        .pickerStyle(.segmented)
+    }
+
+    // MARK: - Dictate section
+
+    private var dictateSection: some View {
+        VStack(spacing: 18) {
+            sessionBanner
+            waveformCard
+            errorBanner
+            transcriptCard
+            Spacer(minLength: 0)
+            recordSection
+        }
+    }
+
+    // MARK: - History section
+
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("History")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !historyStore.entries.isEmpty {
+                    Button {
+                        confirmClearHistory = true
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 4)
+            HistoryList(store: historyStore)
+        }
+        .padding(14)
+        .cardStyle()
+        .confirmationDialog(
+            "Clear all history?",
+            isPresented: $confirmClearHistory,
+            titleVisibility: .visible
+        ) {
+            Button("Clear All", role: .destructive) {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    historyStore.clear()
+                }
+            }
+        } message: {
+            Text("This removes every saved transcription. This can't be undone.")
+        }
     }
 
     // MARK: - Header
@@ -43,6 +130,44 @@ struct TranscriptionView: View {
                     .background(Capsule().fill(Color.teal.opacity(0.16)))
                     .foregroundStyle(Color.teal)
             }
+        }
+    }
+
+    // MARK: - Session banner (keyboard-driven sessions)
+
+    @ViewBuilder
+    private var sessionBanner: some View {
+        if viewModel.isKeyboardSession {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: bannerIcon)
+                    .foregroundStyle(Color.teal)
+                Text(bannerText)
+                    .font(.footnote)
+                    .foregroundStyle(.primary.opacity(0.85))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.teal.opacity(0.12)))
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
+    private var bannerIcon: String {
+        switch viewModel.state {
+        case .ready: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        default: return "keyboard"
+        }
+    }
+
+    private var bannerText: String {
+        switch viewModel.state {
+        case .recording: return "Recording for your keyboard — the text is inserted where you were typing."
+        case .ready: return viewModel.isFinalizing
+            ? "Finalizing your dictation…"
+            : "Dictation complete — insert the text from your keyboard."
+        case .failed: return "The dictation failed — details below."
+        default: return ""
         }
     }
 
@@ -84,6 +209,14 @@ struct TranscriptionView: View {
     }
 
     private var statusText: String {
+        if viewModel.isKeyboardSession {
+            switch viewModel.state {
+            case .recording: return "Dictating for your keyboard"
+            case .ready: return viewModel.isFinalizing ? "Finalizing…" : "Dictation complete"
+            case .failed: return "Something went wrong"
+            case .idle, .requestingPermission: return "Ready"
+            }
+        }
         switch viewModel.state {
         case .idle: return "Ready"
         case .requestingPermission: return "Checking permissions…"
@@ -121,7 +254,7 @@ struct TranscriptionView: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                if !viewModel.finalizedSegments.isEmpty {
+                if !viewModel.isKeyboardSession, !viewModel.finalizedSegments.isEmpty {
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             viewModel.clearSession()
@@ -139,7 +272,10 @@ struct TranscriptionView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        if viewModel.finalizedSegments.isEmpty && viewModel.liveTranscript.isEmpty {
+                        if let readyText = viewModel.readyDisplayText {
+                            segmentRow(readyText)
+                                .id("bottom")
+                        } else if viewModel.finalizedSegments.isEmpty && viewModel.liveTranscript.isEmpty {
                             emptyTranscript
                         } else {
                             ForEach(Array(viewModel.finalizedSegments.enumerated()), id: \.offset) { _, segment in
@@ -221,18 +357,100 @@ struct TranscriptionView: View {
 
     // MARK: - Record control
 
+    @ViewBuilder
     private var recordSection: some View {
-        VStack(spacing: 10) {
-            RecordButtonView(state: viewModel.state) {
-                UIImpactFeedbackGenerator(style: viewModel.state == .recording ? .rigid : .medium)
-                    .impactOccurred()
-                withAnimation(.spring(duration: 0.35)) {
-                    viewModel.toggleRecording()
+        if viewModel.isKeyboardSession {
+            keyboardSessionControls
+        } else {
+            VStack(spacing: 10) {
+                RecordButtonView(state: viewModel.state) {
+                    UIImpactFeedbackGenerator(style: viewModel.state == .recording ? .rigid : .medium)
+                        .impactOccurred()
+                    withAnimation(.spring(duration: 0.35)) {
+                        viewModel.toggleRecording()
+                    }
+                }
+                Text(hintText)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// Controls for a live keyboard session: stop (finalize + insert on the
+    /// keyboard side), cancel, or Done once the result is ready.
+    private var keyboardSessionControls: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 36) {
+                if viewModel.state == .recording || viewModel.isFinalizing {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        withAnimation(.spring(duration: 0.35)) {
+                            viewModel.cancelKeyboardSession()
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.title3.weight(.semibold))
+                            .frame(width: 48, height: 48)
+                            .background(Circle().fill(.white.opacity(0.12)))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Cancel dictation")
+                }
+
+                switch viewModel.state {
+                case .recording:
+                    Button {
+                        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                        withAnimation(.spring(duration: 0.35)) {
+                            viewModel.stopKeyboardSession()
+                        }
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.title2.weight(.bold))
+                            .frame(width: 60, height: 60)
+                            .background(Circle().fill(.red.opacity(0.85)))
+                            .shadow(color: .red.opacity(0.5), radius: 10)
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Stop and insert")
+                case .ready where viewModel.isFinalizing:
+                    ProgressView()
+                        .controlSize(.large)
+                        .frame(width: 60, height: 60)
+                case .ready:
+                    Button {
+                        withAnimation(.spring(duration: 0.35)) {
+                            viewModel.dismissKeyboardReady()
+                        }
+                    } label: {
+                        Label("Done", systemImage: "checkmark")
+                            .font(.headline)
+                            .padding(.horizontal, 28)
+                            .padding(.vertical, 12)
+                            .background(Capsule().fill(Color.teal))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                default:
+                    ProgressView()
+                        .controlSize(.large)
+                        .frame(width: 60, height: 60)
                 }
             }
-            Text(hintText)
+            Text(keyboardHint)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
+        }
+    }
+
+    private var keyboardHint: String {
+        switch viewModel.state {
+        case .recording: return "Return to your keyboard — the text is inserted automatically"
+        case .ready: return viewModel.isFinalizing ? "Finalizing your dictation…" : "Text is ready — insert it from your keyboard"
+        default: return ""
         }
     }
 
