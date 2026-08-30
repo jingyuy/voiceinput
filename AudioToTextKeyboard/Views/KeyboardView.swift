@@ -86,6 +86,10 @@ struct KeyboardView: View {
         HStack(spacing: 10) {
             keyButton(systemName: "space", action: { state.insertText(" ") })
                 .frame(maxWidth: .infinity)
+            SymbolKeyView(options: [".", ",", "?", "!", ":", ";"], keyWidth: 84) { symbol in
+                state.insertText(symbol)
+            }
+            .zIndex(2)
             keyButton(systemName: "return", action: { state.insertText("\n") })
                 .frame(width: 72)
             keyButton(systemName: "delete.left", action: { state.deleteBackward() })
