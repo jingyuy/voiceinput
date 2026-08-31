@@ -50,10 +50,13 @@ final class SpeechRecognitionService {
 
     private(set) var isAvailable = false
     private(set) var supportsOnDevice = false
+    /// The locale the recognizer is currently configured for. Change it with
+    /// `setLocale(_:)` — never mutate directly.
+    private(set) var locale: Locale
 
     // MARK: - Private state
 
-    private let recognizer: SFSpeechRecognizer?
+    private var recognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var sessionToken = UUID()
@@ -62,9 +65,31 @@ final class SpeechRecognitionService {
     // MARK: - Init
 
     init(locale: Locale = Locale(identifier: "en-US")) {
+        self.locale = locale
+        rebuildRecognizer(locale: locale)
+    }
+
+    /// Switches the recognizer to a new locale. Winding down any in-flight
+    /// session first is safe even mid-session (callers usually apply the
+    /// locale while idle, right before a session starts).
+    func setLocale(_ newLocale: Locale) {
+        guard newLocale != locale else { return }
+        finishSession()
+        locale = newLocale
+        rebuildRecognizer(locale: newLocale)
+    }
+
+    /// True when Apple's on-device recognizer supports the given locale on
+    /// this device (the offline language pack is available or downloadable).
+    static func supportsOnDevice(locale: Locale) -> Bool {
+        let recognizer = SFSpeechRecognizer(locale: locale)
+        recognizer?.supportsOnDeviceRecognition = true
+        return recognizer?.supportsOnDeviceRecognition ?? false
+    }
+
+    private func rebuildRecognizer(locale: Locale) {
         recognizer = SFSpeechRecognizer(locale: locale)
         recognizer?.supportsOnDeviceRecognition = true
-
         supportsOnDevice = recognizer?.supportsOnDeviceRecognition ?? false
         isAvailable = recognizer?.isAvailable ?? false
     }

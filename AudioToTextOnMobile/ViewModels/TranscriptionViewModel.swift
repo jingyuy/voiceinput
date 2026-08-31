@@ -34,16 +34,21 @@ final class TranscriptionViewModel {
 
     // MARK: - Published state
 
-    private(set) var isOnDevice = true
+    /// True when on-device recognition is available for the user's chosen
+    /// dictation language on this device. Re-read whenever the locale
+    /// changes (the language menu applies it to the coordinator, which
+    /// rebuilds the recognizer).
+    var isOnDevice: Bool {
+        SpeechRecognitionService.supportsOnDevice(locale: DictationSettings.shared.locale)
+    }
 
     private let coordinator = KeyboardDictationCoordinator.shared
 
-    // MARK: - Init
+    // MARK: - Locale
 
-    init() {
-        // supportsOnDevice is computed from the recognizer at init; a
-        // throwaway instance is safe (no session is started on it).
-        isOnDevice = SpeechRecognitionService(locale: Locale(identifier: "en-US")).supportsOnDevice
+    /// Applies the user's chosen language to the shared recognizer.
+    func applyLocaleFromSettings() {
+        coordinator.applyLocaleFromSettings()
     }
 
     // MARK: - Session state (bound to the coordinator)

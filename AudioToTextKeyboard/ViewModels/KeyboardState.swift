@@ -45,6 +45,9 @@ final class KeyboardState: ObservableObject {
     /// document — the overlay shows a manual insert button as a fallback so
     /// text that was seen is never lost.
     @Published var needsManualInsert = false
+    /// The dictation language shown on the keyboard's globe key (e.g. "EN",
+    /// "中"). Updated when the key cycles the language.
+    @Published var dictationLocaleCode = DictationSettings.shared.shortCode
 
     /// Injected by the SwiftUI layer (`KeyboardRootView`). SwiftUI's
     /// `openURL` is the ONLY way a keyboard extension can reliably open a
@@ -251,6 +254,10 @@ final class KeyboardState: ObservableObject {
     /// Called from `viewWillAppear`.
     func keyboardDidAppear() {
         isVisible = true
+        // The app's menu may have changed the language / cycle list in
+        // another process — reflect it on the globe key.
+        DictationSettings.shared.reloadFromDefaults()
+        dictationLocaleCode = DictationSettings.shared.shortCode
     }
 
     /// Called from `viewWillDisappear`.
@@ -373,6 +380,19 @@ final class KeyboardState: ObservableObject {
 
     func insertText(_ text: String) {
         controller?.insertText(text)
+    }
+
+    /// Cycles the dictation language to the next one in the ENABLED cycle.
+    /// The choice is persisted in the App Group and the app is pinged so a
+    /// live app applies it immediately — the NEXT dictation (app or
+    /// keyboard) uses the new language. With two enabled languages this
+    /// simply toggles between them.
+    func cycleDictationLanguage() {
+        DictationSettings.shared.reloadFromDefaults()
+        DictationSettings.shared.cycleToNextLocale()
+        dictationLocaleCode = DictationSettings.shared.shortCode
+        DarwinNotifications.post()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
     func deleteBackward() {

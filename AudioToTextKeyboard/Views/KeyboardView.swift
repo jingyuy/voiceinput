@@ -86,16 +86,35 @@ struct KeyboardView: View {
         HStack(spacing: 10) {
             keyButton(systemName: "space", action: { state.insertText(" ") })
                 .frame(maxWidth: .infinity)
+            languageKey
             SymbolKeyView(options: [".", ",", "?", "!", ":", ";"], keyWidth: 84) { symbol in
                 state.insertText(symbol)
             }
             .zIndex(2)
             keyButton(systemName: "return", action: { state.insertText("\n") })
-                .frame(width: 72)
-            keyButton(systemName: "delete.left", action: { state.deleteBackward() })
                 .frame(width: 56)
+            keyButton(systemName: "delete.left", action: { state.deleteBackward() })
+                .frame(width: 48)
         }
         .frame(height: 46)
+    }
+
+    /// Globe key: cycles the dictation language on tap (writes the shared
+    /// setting and pings the app). A compact code shows the current one.
+    private var languageKey: some View {
+        Button {
+            state.cycleDictationLanguage()
+        } label: {
+            Label(state.dictationLocaleCode, systemImage: "globe")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 84, height: 46)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(.white.opacity(0.08))
+                )
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Color.teal)
     }
 
     private func keyButton(systemName: String, action: @escaping () -> Void) -> some View {

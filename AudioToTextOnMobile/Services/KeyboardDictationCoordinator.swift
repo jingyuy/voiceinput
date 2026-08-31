@@ -65,6 +65,7 @@ final class KeyboardDictationCoordinator {
             Task { @MainActor in self?.handlePing() }
         }
         wireCallbacks()
+        applyLocaleFromSettings()
         // Keep the mic armed (always-on) so a background request can be
         // adopted without initializing the input unit.
         ensureMicArmed()
@@ -141,6 +142,9 @@ final class KeyboardDictationCoordinator {
         if isActive || captureService.isRunning {
             DictationSharedState.touchAppHeartbeat()
         }
+        // The keyboard's globe key may have changed the dictation language
+        // — reflect it (no-op while a session is live).
+        applyLocaleFromSettings()
         if isActive {
             Task { await sessionLoopTick() }
         } else {
@@ -473,7 +477,19 @@ final class KeyboardDictationCoordinator {
 
     // MARK: - Audio + recognition
 
+    /// Reflects the user's chosen dictation language (DictationSettings) in
+    /// the shared recognizer. Safe to call anytime; a mid-session call is
+    /// ignored (the recognizer is not touched while a session is live).
+    func applyLocaleFromSettings() {
+        guard !isActive, !isFinishing else { return }
+        speechService.setLocale(DictationSettings.shared.locale)
+    }
+
     private func startAudio() async {
+        // The keyboard's globe key (or the app's language menu) may have
+        // changed the dictation language — reflect it before this session
+        // starts. Safe here: no recognition session is in flight yet.
+        speechService.setLocale(DictationSettings.shared.locale)
         let micGranted = await Self.requestMicrophonePermission()
         let speechGranted = await Self.requestSpeechPermission()
         // A stop/cancel may have raced the permission prompts (first use).

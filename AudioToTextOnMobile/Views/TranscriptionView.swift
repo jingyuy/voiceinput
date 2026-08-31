@@ -36,6 +36,12 @@ struct TranscriptionView: View {
             .padding(.bottom, 32)
         }
         .preferredColorScheme(.dark)
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            // The keyboard's globe key may have changed the dictation
+            // language in another process — re-read it and apply.
+            DictationSettings.shared.reloadFromDefaults()
+            viewModel.applyLocaleFromSettings()
+        }
         .onChange(of: viewModel.isKeyboardSession) {
             // A keyboard session (e.g. a cold launch) must be visible —
             // jump back to the Dictate tab so the live recording shows.
@@ -122,6 +128,7 @@ struct TranscriptionView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            languageMenu
             if viewModel.isOnDevice {
                 Label("On-Device", systemImage: "iphone")
                     .font(.caption2.weight(.semibold))
@@ -130,6 +137,48 @@ struct TranscriptionView: View {
                     .background(Capsule().fill(Color.teal.opacity(0.16)))
                     .foregroundStyle(Color.teal)
             }
+        }
+    }
+
+    /// Language picker. CHECKED languages are the ones the keyboard's globe
+    /// key cycles through — you can check as many as you like. The BOLD one
+    /// is the current dictation language (the latest one you tapped). Tap an
+    /// unchecked language to add + select it, tap a checked one to make it
+    /// current, tap the bold current one to remove it from the cycle.
+    private var languageMenu: some View {
+        Menu {
+            ForEach(DictationSettings.supportedLocales, id: \.id) { entry in
+                let settings = DictationSettings.shared
+                let isEnabled = settings.enabledLocales.contains(entry.id)
+                Button {
+                    if isEnabled {
+                        if entry.id == settings.localeIdentifier {
+                            // Remove the current language from the cycle;
+                            // the current locale falls back to another one.
+                            settings.setEnabled(entry.id, enabled: false)
+                        } else {
+                            settings.selectLocale(entry.id)
+                        }
+                    } else {
+                        settings.selectLocale(entry.id)
+                    }
+                    viewModel.applyLocaleFromSettings()
+                } label: {
+                    if isEnabled {
+                        Label(entry.name, systemImage: "checkmark")
+                            .font(.body.weight(entry.id == settings.localeIdentifier ? .bold : .regular))
+                    } else {
+                        Text(entry.name)
+                    }
+                }
+            }
+        } label: {
+            Label(DictationSettings.shared.localeName, systemImage: "globe")
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(Color.teal.opacity(0.16)))
+                .foregroundStyle(Color.teal)
         }
     }
 
