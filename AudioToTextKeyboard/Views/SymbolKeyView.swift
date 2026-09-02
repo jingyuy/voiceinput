@@ -82,11 +82,15 @@ struct SymbolKeyView: View {
     private var key: some View {
         Text(".?!")
             .font(.system(size: 15, weight: .medium))
-            .foregroundStyle(.white.opacity(0.85))
+            .foregroundStyle(.primary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(isPressing ? .white.opacity(0.14) : .white.opacity(0.08))
+                    .fill(isPressing ? Color.kbKeyFillPressed : Color.kbKeyFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(Color.kbKeyStroke, lineWidth: 1)
             )
     }
 
@@ -97,9 +101,11 @@ struct SymbolKeyView: View {
             ForEach(Array(options.enumerated()), id: \.offset) { index, symbol in
                 Text(symbol)
                     .font(.system(size: 26, weight: .medium))
-                    .foregroundStyle(selection == index ? .black : .white)
+                    // The popover follows the theme; the finger-selected
+                    // option is highlighted with the teal accent in both.
+                    .foregroundStyle(selection == index ? Color.white : Color.primary)
                     .frame(width: bubbleSize, height: bubbleSize)
-                    .background(Circle().fill(selection == index ? Color.white : Color.clear))
+                    .background(Circle().fill(selection == index ? Color.teal : Color.clear))
                     .scaleEffect(selection == index ? 1.12 : 1.0)
             }
         }
@@ -107,12 +113,12 @@ struct SymbolKeyView: View {
         .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(red: 0.15, green: 0.16, blue: 0.22))
+                .fill(Color.kbPopoverFill)
                 .shadow(color: .black.opacity(0.35), radius: 8, y: 4)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(.white.opacity(0.1))
+                .strokeBorder(Color.kbPopoverStroke)
         )
     }
 

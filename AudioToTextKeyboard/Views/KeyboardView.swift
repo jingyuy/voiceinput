@@ -42,6 +42,8 @@ struct KeyboardView: View {
                     Text("Starting…")
                 }
                 .font(.caption)
+                // Semantic colors adapt with the host theme — the keyboard
+                // chrome now does too (see Color.kbBackground).
                 .foregroundStyle(.secondary)
             } else {
                 Text("Tap the mic to dictate")
@@ -110,7 +112,11 @@ struct KeyboardView: View {
                 .frame(width: 84, height: 46)
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(.white.opacity(0.08))
+                        .fill(Color.kbKeyFill)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.kbKeyStroke, lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)
@@ -123,9 +129,13 @@ struct KeyboardView: View {
                 .font(.system(size: 19, weight: .medium))
                 .frame(maxWidth: .infinity)
                 .frame(height: 46)
-                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.white.opacity(0.08)))
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.kbKeyFill))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.kbKeyStroke, lineWidth: 1)
+                )
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.white.opacity(0.85))
+        .foregroundStyle(.primary)
     }
 }

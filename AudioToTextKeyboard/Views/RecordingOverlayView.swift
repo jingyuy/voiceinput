@@ -34,6 +34,8 @@ struct RecordingOverlayView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(.footnote.weight(.semibold))
+                    // Semantic styles adapt to the host theme along with the
+                    // adaptive chrome (Color.kbBackground).
                     .foregroundStyle(.secondary)
                 // The globe key only has room for a short code ("EN") — spell
                 // out the dictation language here while the session is live.
@@ -96,8 +98,10 @@ struct RecordingOverlayView: View {
             } label: {
                 Image(systemName: "xmark")
                     .font(.title3.weight(.semibold))
+                    .foregroundStyle(.primary)
                     .frame(width: 46, height: 46)
-                    .background(Circle().fill(.white.opacity(0.1)))
+                    .background(Circle().fill(Color.kbKeyFill))
+                    .overlay(Circle().strokeBorder(Color.kbKeyStroke, lineWidth: 1))
             }
             if state.phase == .ready {
                 if state.needsManualInsert {
@@ -106,6 +110,9 @@ struct RecordingOverlayView: View {
                     } label: {
                         Label("Insert", systemImage: "text.cursor")
                             .font(.headline)
+                            // White stays readable on the teal capsule in both
+                            // themes, so it's pinned explicitly.
+                            .foregroundStyle(.white)
                             .padding(.horizontal, 20)
                             .padding(.vertical, 12)
                             .background(Capsule().fill(Color.teal))
@@ -117,13 +124,13 @@ struct RecordingOverlayView: View {
                 } label: {
                     Image(systemName: "stop.fill")
                         .font(.title2.weight(.bold))
+                        .foregroundStyle(.white)
                         .frame(width: 56, height: 56)
                         .background(Circle().fill(Color.red.opacity(0.85)))
                         .shadow(color: .red.opacity(0.5), radius: 10)
                 }
             }
         }
-        .foregroundStyle(.white)
     }
 
     private func timeString(_ interval: TimeInterval) -> String {
