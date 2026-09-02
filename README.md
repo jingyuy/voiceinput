@@ -183,6 +183,19 @@ codesign -d --entitlements :- build/Build/Products/Debug-iphoneos/AudioToTextOnM
 codesign -d --entitlements :- build/Build/Products/Debug-iphoneos/AudioToTextOnMobile.app/PlugIns/AudioToTextKeyboard.appex
 ```
 
+## Human-controlled agent workflow
+
+From a clean checkout in a Herdr-managed terminal, run:
+
+```bash
+./scripts/herdr-team.sh "Describe the feature to build"
+```
+
+The runner creates isolated Architect, Implementer, Tester, and Master-review
+worktrees. It never merges or pushes. It stops for human review only after the
+Implementer has committed a clean change and both independent review gates have
+approved it. Task reports and runtime logs stay local under `.ai/`.
+
 ### On-device setup
 
 1. Settings → General → Keyboard → Keyboards → **Add New Keyboard** → *Audio To

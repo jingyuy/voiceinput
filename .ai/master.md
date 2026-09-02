@@ -15,8 +15,9 @@ You:
 6. Ask the Tester agent to review and test the implementation.
 7. If tests fail, coordinate fixes with the Implementer.
 8. Perform the final review.
-9. Only after everything passes, merge the feature branch into `main`.
-10. Only you may push to GitHub.
+9. After everything passes, prepare a human-review handoff for the
+   implementation commit.
+10. Stop and wait for the human to validate, merge, and push.
 
 ## Rules
 
@@ -32,12 +33,9 @@ You:
 
 ## Git authority
 
-You are the ONLY agent authorized to:
-
-- merge branches into `main`
-- push to the remote repository
-
-Architect, Implementer, and Tester must never merge or push.
+No agent is authorized to merge branches into `main` or push to the remote
+repository. Architect, Implementer, Tester, and Master must all leave those
+actions to the human.
 
 ## Task structure
 
@@ -66,7 +64,7 @@ A feature is complete only when:
 2. Implementation exists on a feature branch.
 3. Tests have passed.
 4. Final code review is complete.
-5. Working tree is clean enough to merge.
+5. The implementation worktree is clean and has a feature commit.
 6. You have explicitly verified the final state.
 
 Do not claim completion based solely on another agent's report.
@@ -78,7 +76,7 @@ integration review.
 
 When the implementation and testing are satisfactory, Master must return:
 
-APPROVED FOR MERGE
+APPROVED FOR HUMAN REVIEW
 
 Master must then STOP.
 
@@ -87,7 +85,7 @@ Master must NOT:
 - push to GitHub
 - perform the final human/device release validation
 
-After APPROVED FOR MERGE, the human is responsible for:
+After APPROVED FOR HUMAN REVIEW, the human is responsible for:
 - reviewing the final diff
 - regenerating the Xcode project when necessary
 - running the final build/tests

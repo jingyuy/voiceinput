@@ -16,3 +16,12 @@ build/
 
 # XcodeGen
 project.xcworkspace/
+
+# AI agent runtime state
+.ai/runs/*
+!.ai/runs/.gitkeep
+.ai/tasks/*
+!.ai/tasks/.gitkeep
+
+# Local experiments retained for reference, but never part of a feature commit.
+.ai/workflow-backup/
