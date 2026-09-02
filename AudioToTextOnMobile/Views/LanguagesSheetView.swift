@@ -22,10 +22,6 @@ struct LanguagesSheetView: View {
     @Environment(\.dismiss) private var dismiss
     private let settings = DictationSettings.shared
 
-    private var isFull: Bool {
-        settings.selectedLocales.count == DictationSettings.maxLanguages
-    }
-
     var body: some View {
         ZStack {
             BackgroundView()
@@ -50,13 +46,8 @@ struct LanguagesSheetView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Dictation Languages")
-                    .font(.title3.weight(.bold))
-                Text("Up to five — your keyboard's globe key cycles through them.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text("Dictation Languages")
+                .font(.title3.weight(.bold))
             Spacer()
             Button {
                 dismiss()
@@ -77,12 +68,7 @@ struct LanguagesSheetView: View {
 
     private var selectedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader(
-                "Your languages",
-                detail: isFull
-                    ? "Tap a language to make it the ACTIVE one — the globe key cycles through these."
-                    : "The ACTIVE language. Add more below so the globe key can cycle."
-            )
+            sectionHeader("Your languages")
             VStack(spacing: 10) {
                 ForEach(settings.selectedLocales, id: \.self) { id in
                     selectedRow(id)
@@ -146,20 +132,12 @@ struct LanguagesSheetView: View {
 
     private var allSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("All languages", detail: allDetail)
+            sectionHeader("All languages")
             VStack(spacing: 6) {
                 ForEach(DictationSettings.supportedLocales, id: \.id) { entry in
                     allRow(entry)
                 }
             }
-        }
-    }
-
-    private var allDetail: String {
-        if isFull {
-            return "A checkmark is one of yours — tap it to remove, or pick a new language to swap the last one."
-        } else {
-            return "Tap a language to add it to Your languages."
         }
     }
 
@@ -209,15 +187,10 @@ struct LanguagesSheetView: View {
 
     // MARK: - Helpers
 
-    private func sectionHeader(_ title: String, detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title.uppercased())
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(detail)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
     }
 }
 
