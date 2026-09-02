@@ -1,13 +1,23 @@
 import Foundation
 
-/// The user's dictation language, persisted in the App Group defaults so
-/// the container app (the owner of recognition) and the keyboard share it.
+/// The user's dictation languages, persisted in the App Group defaults so
+/// the container app (the owner of recognition) and the keyboard share them.
 ///
 /// There is no API to enumerate the locales Apple's on-device recognizer
 /// supports, so this offers a curated list of the most common ones. Each is
 /// verified at runtime via `SFSpeechRecognizer.supportsOnDeviceRecognition`
 /// (the app's `SpeechRecognitionService` recomputes `supportsOnDevice` for
 /// the chosen locale).
+///
+/// # Model
+/// - `localeIdentifier` is the ACTIVE language — the one the next dictation
+///   uses, whether started from the app or from the keyboard.
+/// - `selectedLocales` holds up to `maxLanguages` (5) languages, the active
+///   one first. The keyboard's globe key CYCLES through these.
+///
+/// The app's language sheet (`LanguagesSheetView`) edits the set:
+/// `activate(_:)` picks the ACTIVE one, `add(_:)` / `deselect(_:)` toggle
+/// membership. The keyboard only cycles through the persisted list.
 @MainActor
 @Observable
 final class DictationSettings {
@@ -33,24 +43,31 @@ final class DictationSettings {
         ("th-TH", "ไทย"),
     ]
 
+    /// The most languages the keyboard's globe key can cycle through (and
+    /// the most the app's language sheet lets you select).
+    static let maxLanguages = 5
+
     private enum Key {
         static let locale = "dictation.locale"
-        /// The languages the keyboard's globe key cycles through.
-        static let enabledLocales = "dictation.enabledLocales"
+        /// Storage key for the selected list — deliberately kept under the
+        /// older "enabledLocales" name so existing installs keep their
+        /// choice. Saved as `[active, …]`.
+        static let selectedLocales = "dictation.enabledLocales"
     }
 
     private(set) var localeIdentifier: String
-    /// The languages the keyboard's globe key cycles through, in the curated
-    /// order. Kept at exactly two — the current locale and the previously
-    /// used one — so the globe key simply toggles between them. Managed by
-    /// `selectLocale(_:)` from the app's language menu; persisted for the
-    /// keyboard.
-    private(set) var enabledLocales: [String]
+    /// Up to `maxLanguages` selected languages, ACTIVE first. This is the
+    /// keyboard's globe-key cycle. Persisted for the keyboard; edited from
+    /// the app's language sheet.
+    private(set) var selectedLocales: [String]
 
     var locale: Locale { Locale(identifier: localeIdentifier) }
 
-    var localeName: String {
-        Self.supportedLocales.first { $0.id == localeIdentifier }?.name ?? localeIdentifier
+    var localeName: String { Self.name(for: localeIdentifier) }
+
+    /// Display name for a supported locale id.
+    static func name(for identifier: String) -> String {
+        supportedLocales.first { $0.id == identifier }?.name ?? identifier
     }
 
     private init() {
@@ -62,30 +79,93 @@ final class DictationSettings {
             current = "en-US"
         }
         localeIdentifier = current
-        enabledLocales = Self.loadEnabledLocales(current: current)
+        selectedLocales = Self.normalized(
+            AppGroup.defaults.stringArray(forKey: Key.selectedLocales) ?? [],
+            current: current
+        )
     }
 
-    /// Loads the persisted globe-cycle list, validating against the curated
-    /// list. Falls back to [en-US, zh-CN] and always includes the current
-    /// locale.
-    private static func loadEnabledLocales(current: String) -> [String] {
-        let saved = AppGroup.defaults.stringArray(forKey: Key.enabledLocales) ?? []
-        var list = saved.filter { id in supportedLocales.contains(where: { $0.id == id }) }
+    // MARK: - Persistence
+
+    /// Writes both keys together so the two processes never observe a torn
+    /// state (e.g. an active language missing from the cycle list).
+    private func persist() {
+        let defaults = AppGroup.defaults
+        defaults.set(localeIdentifier, forKey: Key.locale)
+        defaults.set(selectedLocales, forKey: Key.selectedLocales)
+    }
+
+    /// Builds a valid selected list from raw persisted ids: only supported
+    /// languages, `current` first (so capping can never drop the active
+    /// language), at most `maxLanguages` long. Falls back to the defaults
+    /// when nothing usable was saved.
+    private static func normalized(_ raw: [String], current: String) -> [String] {
+        var list = raw.filter { id in supportedLocales.contains(where: { $0.id == id }) }
         if list.isEmpty {
             list = ["en-US", "zh-CN"]
         }
-        if !list.contains(current) {
-            list.insert(current, at: 0)
+        list.removeAll { $0 == current }
+        list.insert(current, at: 0)
+        if list.count > Self.maxLanguages {
+            list = Array(list.prefix(Self.maxLanguages))
         }
         return list
     }
 
-    func setLocale(_ identifier: String) {
+    // MARK: - Selection (the app's language sheet)
+
+    /// Makes a SELECTED language the ACTIVE one — used by the sheet's
+    /// "Your languages" group, where tapping a row activates it.
+    /// Membership is unchanged; the list stays active-first. No-op if
+    /// `identifier` isn't selected (or is already active).
+    func activate(_ identifier: String) {
         guard identifier != localeIdentifier,
+              selectedLocales.contains(identifier),
               Self.supportedLocales.contains(where: { $0.id == identifier }) else { return }
+        var list = selectedLocales
+        list.removeAll { $0 == identifier }
+        list.insert(identifier, at: 0)
         localeIdentifier = identifier
-        AppGroup.defaults.set(identifier, forKey: Key.locale)
+        selectedLocales = list
+        persist()
     }
+
+    /// Adds a language to the selection WITHOUT touching the ACTIVE one —
+    /// used by the sheet's "All languages" group, where a tap adds a
+    /// language to "Your languages". When `maxLanguages` are already
+    /// selected the LAST one (never the active, which stays first) is
+    /// dropped to make room. No-op if already selected or unsupported.
+    func add(_ identifier: String) {
+        guard !selectedLocales.contains(identifier),
+              Self.supportedLocales.contains(where: { $0.id == identifier }) else { return }
+        var list = selectedLocales
+        if list.count >= Self.maxLanguages {
+            list.removeLast() // drop the trailing (non-active) one
+        }
+        list.append(identifier)
+        selectedLocales = list
+        persist()
+    }
+
+    /// Removes a language from the selection. If it was the active language,
+    /// the remaining one becomes active. The last remaining language cannot
+    /// be removed (dictation needs at least one). Returns whether it was
+    /// removed.
+    @discardableResult
+    func deselect(_ identifier: String) -> Bool {
+        guard selectedLocales.contains(identifier),
+              selectedLocales.count > 1 else { return false }
+        var list = selectedLocales
+        list.removeAll { $0 == identifier }
+        if identifier == localeIdentifier {
+            localeIdentifier = list[0]
+        }
+        selectedLocales = list
+        persist()
+        return true
+    }
+
+    // MARK: - Keyboard globe cycle
 
     /// Compact label for the keyboard's globe key (e.g. "EN", "中", "日",
     /// "한").
@@ -100,70 +180,56 @@ final class DictationSettings {
         }
     }
 
-    /// Moves to the next locale in the ENABLED set (the globe-key cycle),
-    /// wrapping around. With two enabled languages this simply toggles
-    /// between them.
+    /// Moves to the next language in the SELECTED cycle (the keyboard's
+    /// globe key). The list is a ring ordered active-first; each tap rotates
+    /// the ring so the next language takes the lead — with several selected,
+    /// repeated taps walk through ALL of them and wrap around. With one
+    /// selected it stays put.
     func cycleToNextLocale() {
-        guard let idx = enabledLocales.firstIndex(of: localeIdentifier) else {
-            setLocale(enabledLocales.first ?? "en-US")
-            return
+        guard selectedLocales.count > 1,
+              let idx = selectedLocales.firstIndex(of: localeIdentifier) else { return }
+        let count = selectedLocales.count
+        // Ring rotation: the successor of the current active leads the new
+        // list and the relative order is preserved (the list always ends
+        // active-first again).
+        let rotate = (idx + 1) % count
+        let next = selectedLocales[rotate]
+        localeIdentifier = next
+        if rotate != 0 {
+            selectedLocales = Array(selectedLocales[rotate...]) + Array(selectedLocales[..<rotate])
         }
-        let next = enabledLocales[(idx + 1) % enabledLocales.count]
-        setLocale(next)
+        persist()
     }
 
-    /// The app's language picker calls this. Makes `identifier` the current
-    /// locale (the latest clicked language becomes the current one) and
-    /// ensures it's in the globe-key cycle (checked in the picker).
-    func selectLocale(_ identifier: String) {
-        guard Self.supportedLocales.contains(where: { $0.id == identifier }) else { return }
-        localeIdentifier = identifier
-        AppGroup.defaults.set(identifier, forKey: Key.locale)
-        if !enabledLocales.contains(identifier) {
-            enabledLocales.append(identifier)
-            AppGroup.defaults.set(enabledLocales, forKey: Key.enabledLocales)
-        }
-    }
-
-    /// Adds/removes a language to/from the globe-key cycle (the checked set
-    /// in the app's language picker). The current locale can't be removed
-    /// while another enabled language exists — the current locale switches
-    /// to that other one first.
-    func setEnabled(_ identifier: String, enabled: Bool) {
-        guard Self.supportedLocales.contains(where: { $0.id == identifier }) else { return }
-        var list = enabledLocales
-        if enabled {
-            if !list.contains(identifier) {
-                list.append(identifier)
-            }
-        } else {
-            if identifier == localeIdentifier {
-                guard let fallback = list.first(where: { $0 != identifier }) else { return }
-                setLocale(fallback)
-            }
-            list.removeAll { $0 == identifier }
-        }
-        enabledLocales = list
-        AppGroup.defaults.set(list, forKey: Key.enabledLocales)
-    }
+    // MARK: - Cross-process sync
 
     /// Re-reads the persisted values — e.g. after the keyboard extension
-    /// changed them in another process. No-op when unchanged.
+    /// changed them in another process. Normalizes (caps the list, keeps the
+    /// active language first) and no-ops when nothing changed.
     func reloadFromDefaults() {
-        let saved = AppGroup.defaults.string(forKey: Key.locale)
-        if let saved, saved != localeIdentifier,
+        let defaults = AppGroup.defaults
+        var changed = false
+
+        if let saved = defaults.string(forKey: Key.locale),
+           saved != localeIdentifier,
            Self.supportedLocales.contains(where: { $0.id == saved }) {
             localeIdentifier = saved
+            changed = true
         }
-        if let saved = AppGroup.defaults.stringArray(forKey: Key.enabledLocales),
-           !saved.isEmpty {
-            let valid = saved.filter { id in Self.supportedLocales.contains(where: { $0.id == id }) }
-            if !valid.isEmpty {
-                enabledLocales = valid
-                if !enabledLocales.contains(localeIdentifier) {
-                    enabledLocales.insert(localeIdentifier, at: 0)
-                }
+
+        if let saved = defaults.stringArray(forKey: Key.selectedLocales) {
+            let fixed = Self.normalized(saved, current: localeIdentifier)
+            if fixed != selectedLocales {
+                selectedLocales = fixed
+                changed = true
             }
+        }
+
+        if changed {
+            // Self-heal: write the canonical form back (e.g. an oversized
+            // list left over from an older build with many enabled
+            // languages).
+            persist()
         }
     }
 }

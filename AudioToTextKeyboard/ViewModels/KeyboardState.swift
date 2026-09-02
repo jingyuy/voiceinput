@@ -429,8 +429,8 @@ final class KeyboardState: ObservableObject {
     /// Cycles the dictation language to the next one in the ENABLED cycle.
     /// The choice is persisted in the App Group and the app is pinged so a
     /// live app applies it immediately — the NEXT dictation (app or
-    /// keyboard) uses the new language. With two enabled languages this
-    /// simply toggles between them.
+    /// keyboard) uses the new language. With several enabled languages this
+    /// cycles through them.
     func cycleDictationLanguage() {
         DictationSettings.shared.reloadFromDefaults()
         DictationSettings.shared.cycleToNextLocale()

@@ -9,6 +9,7 @@ struct TranscriptionView: View {
     @State private var viewModel = TranscriptionViewModel()
     @State private var historyStore = TranscriptionHistoryStore.shared
     @State private var confirmClearHistory = false
+    @State private var showLanguages = false
 
     private enum MainSection: Hashable {
         case dictate
@@ -49,6 +50,11 @@ struct TranscriptionView: View {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     section = .dictate
                 }
+            }
+        }
+        .sheet(isPresented: $showLanguages) {
+            LanguagesSheetView {
+                viewModel.applyLocaleFromSettings()
             }
         }
     }
@@ -128,7 +134,7 @@ struct TranscriptionView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            languageMenu
+            languageButton
             if viewModel.isOnDevice {
                 Label("On-Device", systemImage: "iphone")
                     .font(.caption2.weight(.semibold))
@@ -140,38 +146,12 @@ struct TranscriptionView: View {
         }
     }
 
-    /// Language picker. CHECKED languages are the ones the keyboard's globe
-    /// key cycles through — you can check as many as you like. The BOLD one
-    /// is the current dictation language (the latest one you tapped). Tap an
-    /// unchecked language to add + select it, tap a checked one to make it
-    /// current, tap the bold current one to remove it from the cycle.
-    private var languageMenu: some View {
-        Menu {
-            ForEach(DictationSettings.supportedLocales, id: \.id) { entry in
-                let settings = DictationSettings.shared
-                let isEnabled = settings.enabledLocales.contains(entry.id)
-                Button {
-                    if isEnabled {
-                        if entry.id == settings.localeIdentifier {
-                            // Remove the current language from the cycle;
-                            // the current locale falls back to another one.
-                            settings.setEnabled(entry.id, enabled: false)
-                        } else {
-                            settings.selectLocale(entry.id)
-                        }
-                    } else {
-                        settings.selectLocale(entry.id)
-                    }
-                    viewModel.applyLocaleFromSettings()
-                } label: {
-                    if isEnabled {
-                        Label(entry.name, systemImage: "checkmark")
-                            .font(.body.weight(entry.id == settings.localeIdentifier ? .bold : .regular))
-                    } else {
-                        Text(entry.name)
-                    }
-                }
-            }
+    /// Opens the language sheet. The capsule shows the ACTIVE language (the
+    /// one the next dictation uses); the sheet edits the up-to-five language
+    /// pair the keyboard's globe key cycles through.
+    private var languageButton: some View {
+        Button {
+            showLanguages = true
         } label: {
             Label(DictationSettings.shared.localeName, systemImage: "globe")
                 .font(.caption2.weight(.semibold))
@@ -180,6 +160,7 @@ struct TranscriptionView: View {
                 .background(Capsule().fill(Color.teal.opacity(0.16)))
                 .foregroundStyle(Color.teal)
         }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Session banner (keyboard-driven sessions)

@@ -247,13 +247,18 @@ armed afterwards.
 ## Privacy
 
 - Mic + speech permission descriptions configured in `project.yml`.
-- Recognition locale: `en-US` (`SpeechRecognitionService(locale:)`).
+- Recognition language is user-selectable: an **active** language plus up to
+  four alternates (five total). They live in `Shared/DictationSettings.swift` (App
+  Group defaults), the app's language sheet edits them, and the keyboard's
+  globe key cycles between them. The recognizer is rebuilt for the active
+  language (`SpeechRecognitionService.setLocale(_:)`).
 - All recognition is on-device; the always-armed mic is the privacy cost of
   instant background dictation.
 
 ## Roadmap
 
-- Locale picker for multilingual on-device recognition
+- Mid-dictation language switching / speech-language auto-detection (the
+  active language is currently fixed for the whole session)
 - Punctuation/capitalization post-processing with Natural Language
 - Replace the always-armed mic with a configurable opt-in
 - Swap the recognizer for a custom on-device model (e.g. WhisperKit) behind the
