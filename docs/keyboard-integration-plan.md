@@ -134,7 +134,9 @@ flowchart LR
 | `dictation.status` | `idle/requested/recording/transcribing/ready/failed` | app | keyboard |
 | `dictation.liveTranscript` | String | app | keyboard (optional live preview) |
 | `dictation.finalText` | String + session token | app | keyboard (→ insert) |
-| `dictation.requestedAt` / `stopRequested` / `cancelRequested` | Timestamp/Bool | keyboard | app |
+| `dictation.requestedAt` | Timestamp | keyboard | both (request TTL / `.starting` timeout) |
+| `dictation.keyboardAliveAt` | Timestamp | keyboard | app (orphan finalizer: keyboard gone > ~10 s) |
+| `dictation.stopFor` / `dictation.cancelFor` | Session token | keyboard | app (only honored when it matches the served session) |
 | Darwin pings | — | both | both |
 
 ## 4. Flows

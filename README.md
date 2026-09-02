@@ -72,13 +72,19 @@ flowchart LR
 | `.ready` | app | `finalText` published → keyboard inserts once, clears |
 | `.failed` | app | `errorMessage` published → keyboard shows it |
 
-Keyboard → app controls: `stopRequested` / `cancelRequested` booleans + Darwin
-ping. Liveness is `appHeartbeat` (written ONLY by the app — armed engine,
-session loop, ping): the keyboard uses its **freshness** to decide
-Darwin-wake (4 s) vs cold-launch (1.5 s), and detects app death fast (stale
-> 8 s → fail immediately instead of hanging). `lastActivity` is protocol/
-speech activity (idle timeouts); `readyAt` is the timestamp of `.ready` —
-the 10-minute surprise-insert gate.
+Keyboard → app controls: `stopFor` / `cancelFor` carry the SESSION TOKEN the
+control is aimed at (a control for a dead session can never kill a new one),
+plus a Darwin ping. `requestedAt` is the KEYBOARD's own request clock (the
+app can't refresh it — both sides' request timeouts read it); `keyboardAliveAt`
+is a keyboard presence marker (touched per poll) that lets the app finalize
+an orphan session ~10 s after its keyboard vanished. Liveness is
+`appHeartbeat` (written ONLY by the app — armed engine, session loop, ping):
+the keyboard uses its **freshness** to decide Darwin-wake (4 s) vs
+cold-launch (1.5 s), and detects app death fast (stale > 8 s → fail
+immediately instead of hanging). `lastActivity` is protocol/speech activity
+(idle timeouts); `readyAt` is the timestamp of `.ready` — the 10-minute
+surprise-insert gate. A NEWER keyboard request always preempts whatever
+session the app is serving, so a wedged app heals on the next mic tap.
 
 ### IPC keys
 
@@ -89,7 +95,9 @@ the 10-minute surprise-insert gate.
 | `liveText` / `audioLevel` | app | streaming partial transcript + mic level |
 | `finalText` | app | final result (keyboard clears after inserting) |
 | `errorMessage` | app | failure text (keyboard clears after showing) |
-| `stopRequested` / `cancelRequested` | keyboard | boolean controls + ping |
+| `stopFor` / `cancelFor` | keyboard | session token the control targets + ping |
+| `requestedAt` | keyboard | own request clock (keyboard-only writer; timeout base) |
+| `keyboardAliveAt` | keyboard | presence marker (touched per poll; app orphan finalizer) |
 | `lastActivity` | both | speech/protocol activity (idle timeouts, stale-request age) |
 | `appHeartbeat` | **app only** | liveness; fresh = alive AND can serve in background |
 | `readyAt` | app | when `.ready` was published (freshness gate for auto-insert) |

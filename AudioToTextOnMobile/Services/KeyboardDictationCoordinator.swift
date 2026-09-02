@@ -25,6 +25,21 @@ final class KeyboardDictationCoordinator {
         category: "DictationCoordinator"
     )
 
+    // MARK: - Timeout / freshness constants
+
+    /// A `.requested` older than this (by the KEYBOARD's own clock) is
+    /// discarded — the requesting keyboard gave up on it.
+    static let requestTTL: TimeInterval = 30
+    /// How long a backgrounded keyboard session may run with NO keyboard
+    /// presence before the app finalizes it (the orphan killer).
+    static let presenceGrace: TimeInterval = 10
+    /// No REAL speech (RMS above the noise floor / transcript change) for
+    /// this long → finalize with what we have.
+    static let speechIdleTimeout: TimeInterval = 60
+    /// Absolute session-length cap — no session can ever run forever, even
+    /// if every other timeout is defeated.
+    static let maxSessionDuration: TimeInterval = 240
+
     // MARK: - Published state (drives the app's own overlay UI)
 
     private(set) var isActive = false
@@ -55,6 +70,12 @@ final class KeyboardDictationCoordinator {
     /// When the session loop last attempted a mid-session engine re-arm —
     /// used to escalate a still-stalled engine to finalize-with-partial.
     private var stallReArmAttemptedAt: Date?
+    /// When the current session last heard REAL speech (RMS above the noise
+    /// floor, or a transcript change). Drives the speech-idle finalize.
+    /// Unlike `lastActivity` it cannot be refreshed by mere engine liveness.
+    private var lastSpeechAt = Date()
+    /// When the current session started — base of the absolute cap.
+    private var sessionStartedAt = Date()
     private var sessionLoopTask: Task<Void, Never>?
     private var finishWatchdog: Task<Void, Never>?
     private var armWatcherTask: Task<Void, Never>?
@@ -296,7 +317,9 @@ final class KeyboardDictationCoordinator {
             guard isAppForegroundish else { return }
             let token = DictationSharedState.sessionToken(defaults)
             guard !token.isEmpty else { return }
-            if DictationSharedState.wantsCancel(defaults) || DictationSharedState.wantsStop(defaults) {
+            // Only a cancel/stop aimed AT this orphan session counts.
+            if DictationSharedState.cancelRequested(for: token, defaults: defaults)
+                || DictationSharedState.stopRequested(for: token, defaults: defaults) {
                 DictationSharedState.reset(defaults: defaults)
                 DictationSharedState.setStatus(.idle, defaults: defaults)
                 Self.logger.info("checkRequested: orphan session was cancelled — discarded")
@@ -328,51 +351,38 @@ final class KeyboardDictationCoordinator {
     }
 
     private func checkRequestedSession(defaults: UserDefaults) async {
-        let requestedToken = DictationSharedState.sessionToken(defaults)
-        guard !requestedToken.isEmpty else { return }
-
-        // Don't adopt a request the keyboard gave up on (it disappeared
-        // before we could adopt, e.g. the cold-launch race). Those are
-        // silently discarded, so they can't start an orphan session later.
-        if let requestedAt = DictationSharedState.lastActivityDate,
-           Date().timeIntervalSince(requestedAt) > 30 {
-            DictationSharedState.reset(defaults: defaults)
-            DictationSharedState.setStatus(.idle, defaults: defaults)
-            Self.logger.info("checkRequested: stale request discarded")
-            return
-        }
-
-        // The keyboard abandoned this request before we adopted it (it was
-        // dismissed, or stop/cancel was tapped while `.starting`). Never
-        // adopt a session nobody is listening to — it would record into a
-        // void until the idle timeout.
-        if DictationSharedState.wantsCancel(defaults) || DictationSharedState.wantsStop(defaults) {
-            DictationSharedState.reset(defaults: defaults)
-            DictationSharedState.setStatus(.idle, defaults: defaults)
-            Self.logger.info("checkRequested: request cancelled before adoption — discarded")
-            return
-        }
-
-        let isForeground = UIApplication.shared.applicationState == .active
-        let micGranted = AVAudioApplication.shared.recordPermission == .granted
-        let speechGranted = SFSpeechRecognizer.authorizationStatus() == .authorized
         // Background adoption is only possible when the mic is ALREADY
         // running (always-armed engine): iOS forbids starting the input unit
         // from the background (AURemoteIO 560557684 '!int'), so without an
         // armed engine we must let the keyboard cold-launch us instead.
+        let isForeground = UIApplication.shared.applicationState == .active
+        let micGranted = AVAudioApplication.shared.recordPermission == .granted
+        let speechGranted = SFSpeechRecognizer.authorizationStatus() == .authorized
         let canAdoptInBackground = micGranted && speechGranted && captureService.isRunning
         guard isForeground || canAdoptInBackground else { return }
 
-        adoptSession(token: requestedToken)
+        await handleIncomingRequest()
     }
 
+    /// Adopts a keyboard `.requested` session. When we are ALREADY serving a
+    /// DIFFERENT keyboard session (an orphan the keyboard walked away from),
+    /// the new request PREEMPTS it — a newer request always wins, which is
+    /// what makes a wedged app heal on the very next mic tap.
     private func adoptSession(token: String) {
-        guard !isActive else { return }
+        if isActive {
+            // Never preempt a session driven by the app's own UI (a
+            // keyboard request can't genuinely race it — no keyboard is
+            // visible while the app is foreground — this is defensive).
+            guard !isAppSession else { return }
+            preemptCurrentSession()
+        }
         self.token = token
         isActive = true
         isAppSession = false
         isFinishing = false
         stallReArmAttemptedAt = nil
+        lastSpeechAt = Date()
+        sessionStartedAt = Date()
         finalizedSegments = []
         liveText = ""
         finalText = ""
@@ -382,6 +392,78 @@ final class KeyboardDictationCoordinator {
         startSessionLoop()
         Self.logger.info("adopting session (token \(token.prefix(8)))")
         Task { await startAudio() }
+    }
+
+    /// Handles a keyboard `.requested` session from ANY state (idle or
+    /// wedged on an orphan). Freshness comes from the keyboard's own
+    /// request clock; a fresh request is adopted unconditionally, after
+    /// preempting whatever we are stuck on.
+    private func handleIncomingRequest() async {
+        let defaults = AppGroup.defaults
+        let incoming = DictationSharedState.sessionToken(defaults)
+        guard !incoming.isEmpty else { return }
+
+        // Stale by the KEYBOARD's own clock → the requesting keyboard gave
+        // up (its process died, it timed out, the user walked away).
+        // Discard so it can't start an orphan session later.
+        if let requestedAt = DictationSharedState.requestedAtDate(defaults) {
+            guard Date().timeIntervalSince(requestedAt) < Self.requestTTL else {
+                Self.logger.info("handleIncomingRequest: stale request (keyboard clock) — discarded")
+                DictationSharedState.reset(defaults: defaults)
+                DictationSharedState.setStatus(.idle, defaults: defaults)
+                return
+            }
+        }
+
+        // Already serving THIS exact request (duplicate ping / scene wake)
+        // — nothing to do.
+        if isActive && token == incoming { return }
+
+        // The requesting keyboard cancelled before we could adopt.
+        if DictationSharedState.cancelRequested(for: incoming, defaults: defaults) {
+            Self.logger.info("handleIncomingRequest: request cancelled by keyboard — discarded")
+            DictationSharedState.reset(defaults: defaults)
+            DictationSharedState.setStatus(.idle, defaults: defaults)
+            return
+        }
+
+        adoptSession(token: incoming)
+    }
+
+    /// Drops whatever keyboard session we are serving (an orphan — nobody
+    /// is listening, which is why a NEWER request may supersede it). Partial
+    /// text goes to history (never silently lost) but is NOT published to
+    /// the shared store: that would race the incoming session. The capture
+    /// engine stays armed for the new session.
+    private func preemptCurrentSession() {
+        Self.logger.info("preempting current session (token \(self.token.prefix(8)))")
+        finishWatchdog?.cancel()
+        if status == .recording || status == .transcribing || isFinishing {
+            speechService.cancelSession()
+            let partial = (finalizedSegments + [liveText])
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !partial.isEmpty {
+                TranscriptionHistoryStore.shared.add(partial)
+            }
+        }
+        finalizedSegments = []
+        liveText = ""
+        finalText = ""
+        errorMessage = nil
+        isFinishing = false
+        stallReArmAttemptedAt = nil
+        // Shared state is left alone — adoptSession rewrites it.
+    }
+
+    /// True when a KEYBOARD session has no listener left: the app is
+    /// backgrounded (its UI can't stop the session) AND the keyboard hasn't
+    /// polled within the grace period (it died or the user left). This is
+    /// the orphan-killer: no session can outlive its keyboard by much.
+    private var keyboardUnattendedInBackground: Bool {
+        guard !isAppSession, !isAppForeground else { return false }
+        return DictationSharedState.keyboardPresenceStale(Self.presenceGrace)
     }
 
     // MARK: - App-side sessions (the app's own UI)
@@ -405,6 +487,8 @@ final class KeyboardDictationCoordinator {
         isAppSession = true
         isFinishing = false
         stallReArmAttemptedAt = nil
+        lastSpeechAt = Date()
+        sessionStartedAt = Date()
         finalizedSegments = []
         liveText = ""
         finalText = ""
@@ -686,10 +770,15 @@ final class KeyboardDictationCoordinator {
         }
         let defaults = AppGroup.defaults
         switch DictationSharedState.status(defaults) {
+        case .requested:
+            // A fresh keyboard request while we're busy PREEMPTS whatever
+            // we're stuck on (see handleIncomingRequest) — this is what
+            // makes a wedged app heal on the next mic tap.
+            await handleIncomingRequest()
         case .recording:
-            if DictationSharedState.wantsCancel(defaults) {
+            if DictationSharedState.cancelRequested(for: token, defaults: defaults) {
                 cancelSession()
-            } else if DictationSharedState.wantsStop(defaults) {
+            } else if DictationSharedState.stopRequested(for: token, defaults: defaults) {
                 beginFinish()
             } else if captureService.isRunning, !captureService.hasRecentBuffers(within: 3) {
                 // The engine claims to run but stopped delivering audio
@@ -697,14 +786,46 @@ final class KeyboardDictationCoordinator {
                 handleSessionStall()
             } else {
                 stallReArmAttemptedAt = nil
-                if let last = DictationSharedState.lastActivityDate,
-                   Date().timeIntervalSince(last) > 60 {
-                    // No speech for a minute (keyboard may be dead) — finalize.
-                    Self.logger.info("dictation idle 60s — auto-finalizing")
+                if keyboardUnattendedInBackground {
+                    // The ONLY listener of a backgrounded keyboard session is
+                    // the keyboard itself. It's been gone past the grace
+                    // period — finalize so partial text is preserved and the
+                    // orphan can't wedge the app.
+                    Self.logger.info("keyboard gone \(Self.presenceGrace)s — finalizing orphan session")
+                    beginFinish()
+                } else if Date().timeIntervalSince(lastSpeechAt) > Self.speechIdleTimeout {
+                    // No REAL speech (silence buffers don't count) for a
+                    // minute — finalize so the session can't leak.
+                    Self.logger.info("no real speech for \(Self.speechIdleTimeout)s — auto-finalizing")
+                    beginFinish()
+                } else if Date().timeIntervalSince(sessionStartedAt) > Self.maxSessionDuration {
+                    // Absolute cap: even a live-looking session must end.
+                    Self.logger.info("session exceeded \(Self.maxSessionDuration)s cap — auto-finalizing")
                     beginFinish()
                 }
             }
-        case .transcribing, .ready, .requested, .failed:
+        case .transcribing:
+            // The user cancelled while we were finalizing — abort (the
+            // keyboard shows ✕ during this phase too). Otherwise: waiting
+            // on the recognizer — the finish watchdog owns this.
+            if DictationSharedState.cancelRequested(for: token, defaults: defaults) {
+                Self.logger.info("cancel requested during finalizing — aborting session")
+                cancelSession()
+            } else {
+                break
+            }
+        case .ready:
+            // The keyboard inserted (status → .idle) or died before
+            // consuming the result. Backgrounded with no keyboard: stand
+            // down so the app can't sit active on a result nobody is
+            // watching — the text STAYS in the store for the keyboard's
+            // freshness-gated insert. Foreground, the app UI shows the
+            // "Done" control, so wait for the user.
+            if !isAppForeground, DictationSharedState.keyboardPresenceStale(Self.presenceGrace) {
+                Self.logger.info("keyboard absent after .ready — standing down (result kept)")
+                standDown(resetStatus: false)
+            }
+        case .failed:
             break
         case .idle:
             // The keyboard inserted (or cancelled) and cleared the state.
@@ -720,6 +841,8 @@ final class KeyboardDictationCoordinator {
         speechService.onTranscriptUpdate = { [weak self] text in
             guard let self else { return }
             self.liveText = text
+            // A transcript change is real speech by definition.
+            if self.isActive { self.lastSpeechAt = Date() }
             // App-side sessions must not pollute the shared keyboard protocol.
             guard !self.isAppSession else { return }
             let defaults = AppGroup.defaults
@@ -730,6 +853,7 @@ final class KeyboardDictationCoordinator {
             guard let self else { return }
             self.finalizedSegments.append(text)
             self.liveText = ""
+            if self.isActive { self.lastSpeechAt = Date() }
             if !self.isAppSession {
                 let defaults = AppGroup.defaults
                 defaults.set("", forKey: DictationSharedState.Key.liveText)
@@ -813,15 +937,17 @@ final class KeyboardDictationCoordinator {
         guard now.timeIntervalSince(lastLevelPublish) >= 0.1 else { return }
         lastLevelPublish = now
         audioLevel = level
+        // Only RMS above the noise floor counts as REAL speech. Silence
+        // buffers keep arriving while the engine runs, so they must never
+        // count as activity for the speech-idle finalize.
+        if level > 0.02, isActive {
+            lastSpeechAt = now
+        }
         // App-side sessions must not pollute the shared keyboard protocol.
         guard !isAppSession else { return }
         let defaults = AppGroup.defaults
         defaults.set(level, forKey: DictationSharedState.Key.audioLevel)
-        if isActive {
-            // Buffers are flowing during a live session — that IS speech
-            // activity for the idle timeouts.
-            DictationSharedState.touchActivity(defaults: defaults)
-        } else if captureService.isRunning {
+        if !isActive, captureService.isRunning {
             // Armed-but-idle: keep the app-heartbeat fresh so the keyboard
             // knows the app is alive and won't cold-launch it.
             DictationSharedState.touchAppHeartbeat(defaults: defaults)

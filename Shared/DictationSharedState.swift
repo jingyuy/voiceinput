@@ -12,8 +12,9 @@ import Foundation
 ///   app      →  .ready      + finalText   (keyboard inserts once, then clears)
 ///   app      →  .failed     + errorMessage
 ///
-/// The keyboard requests stop/cancel by setting `stopRequested` /
-/// `cancelRequested` and pinging a Darwin notification.
+/// The keyboard requests stop/cancel by writing the target session's token
+/// into `stopFor` / `cancelFor` and pinging a Darwin notification. The app
+/// only honors a flag that names the session it is currently serving.
 enum DictationSharedState {
 
     enum Status: String {
@@ -32,8 +33,21 @@ enum DictationSharedState {
         static let finalText = "dictation.finalText"
         static let errorMessage = "dictation.errorMessage"
         static let audioLevel = "dictation.audioLevel"
-        static let stopRequested = "dictation.stopRequested"
-        static let cancelRequested = "dictation.cancelRequested"
+        /// Session-ID-tagged control flags (KEYBOARD-only writer). The app
+        /// only honors a flag whose value equals the session it is serving,
+        /// so a stale flag from a dead session can never kill a new one.
+        static let stopFor = "dictation.stopFor"
+        static let cancelFor = "dictation.cancelFor"
+        /// The keyboard's OWN clock when it wrote the current `.requested`
+        /// (KEYBOARD-only writer). Both sides use it for freshness — unlike
+        /// `lastActivity`, a wedged app cannot keep it alive.
+        static let requestedAt = "dictation.requestedAt"
+        /// Keyboard presence: touched while the keyboard is polling a live
+        /// session (KEYBOARD-only writer). The app finalizes a backgrounded
+        /// session whose keyboard has been gone for a while — this is what
+        /// ends orphan sessions (keyboard died / user left) instead of
+        /// letting them record forever.
+        static let keyboardAliveAt = "dictation.keyboardAliveAt"
         static let lastActivity = "dictation.lastActivity"
         static let isColdStart = "dictation.isColdStart"
         /// App-only liveness marker: written ONLY by the container app
@@ -89,12 +103,39 @@ enum DictationSharedState {
         return interval > 0 ? Date(timeIntervalSinceReferenceDate: interval) : nil
     }
 
-    static func wantsStop(_ defaults: UserDefaults = AppGroup.defaults) -> Bool {
-        defaults.bool(forKey: Key.stopRequested)
+    /// When the keyboard wrote the current `.requested` (the keyboard's OWN
+    /// clock — the app cannot refresh it, so it is a trustworthy timeout).
+    static func requestedAtDate(_ defaults: UserDefaults = AppGroup.defaults) -> Date? {
+        let interval = defaults.double(forKey: Key.requestedAt)
+        return interval > 0 ? Date(timeIntervalSinceReferenceDate: interval) : nil
     }
 
-    static func wantsCancel(_ defaults: UserDefaults = AppGroup.defaults) -> Bool {
-        defaults.bool(forKey: Key.cancelRequested)
+    /// When the keyboard last polled a live session (keyboard presence).
+    static func keyboardAliveAtDate(_ defaults: UserDefaults = AppGroup.defaults) -> Date? {
+        let interval = defaults.double(forKey: Key.keyboardAliveAt)
+        return interval > 0 ? Date(timeIntervalSinceReferenceDate: interval) : nil
+    }
+
+    /// True when the keyboard hasn't polled for `threshold` seconds — i.e.
+    /// nobody is listening to the current session.
+    static func keyboardPresenceStale(_ threshold: TimeInterval,
+                                      defaults: UserDefaults = AppGroup.defaults) -> Bool {
+        guard let date = keyboardAliveAtDate(defaults) else { return true }
+        return Date().timeIntervalSince(date) > threshold
+    }
+
+    /// True when the keyboard asked the app to finalize session `token`.
+    static func stopRequested(for token: String,
+                              defaults: UserDefaults = AppGroup.defaults) -> Bool {
+        guard !token.isEmpty else { return false }
+        return defaults.string(forKey: Key.stopFor) == token
+    }
+
+    /// True when the keyboard asked the app to cancel session `token`.
+    static func cancelRequested(for token: String,
+                                defaults: UserDefaults = AppGroup.defaults) -> Bool {
+        guard !token.isEmpty else { return false }
+        return defaults.string(forKey: Key.cancelFor) == token
     }
 
     // MARK: - Writes
@@ -107,8 +148,8 @@ enum DictationSharedState {
         defaults.removeObject(forKey: Key.readyAt)
         defaults.removeObject(forKey: Key.errorMessage)
         defaults.removeObject(forKey: Key.audioLevel)
-        defaults.set(false, forKey: Key.stopRequested)
-        defaults.set(false, forKey: Key.cancelRequested)
+        defaults.removeObject(forKey: Key.stopFor)
+        defaults.removeObject(forKey: Key.cancelFor)
     }
 
     /// Removes a consumed (or expired) final result.
@@ -126,8 +167,10 @@ enum DictationSharedState {
         defaults.removeObject(forKey: Key.readyAt)
         defaults.removeObject(forKey: Key.errorMessage)
         defaults.removeObject(forKey: Key.audioLevel)
-        defaults.set(false, forKey: Key.stopRequested)
-        defaults.set(false, forKey: Key.cancelRequested)
+        defaults.removeObject(forKey: Key.stopFor)
+        defaults.removeObject(forKey: Key.cancelFor)
+        defaults.removeObject(forKey: Key.requestedAt)
+        defaults.removeObject(forKey: Key.keyboardAliveAt)
         defaults.removeObject(forKey: Key.lastActivity)
         defaults.removeObject(forKey: Key.isColdStart)
         defaults.removeObject(forKey: Key.appHeartbeat)
@@ -146,5 +189,22 @@ enum DictationSharedState {
 
     static func touchActivity(defaults: UserDefaults = AppGroup.defaults) {
         defaults.set(Date.timeIntervalSinceReferenceDate, forKey: Key.lastActivity)
+    }
+
+    /// The keyboard asks the app to finalize (stop) session `token`.
+    static func requestStop(for token: String, defaults: UserDefaults = AppGroup.defaults) {
+        guard !token.isEmpty else { return }
+        defaults.set(token, forKey: Key.stopFor)
+    }
+
+    /// The keyboard asks the app to cancel (abort) session `token`.
+    static func requestCancel(for token: String, defaults: UserDefaults = AppGroup.defaults) {
+        guard !token.isEmpty else { return }
+        defaults.set(token, forKey: Key.cancelFor)
+    }
+
+    /// The keyboard marks itself present (it is polling a live session).
+    static func touchKeyboardPresence(defaults: UserDefaults = AppGroup.defaults) {
+        defaults.set(Date.timeIntervalSinceReferenceDate, forKey: Key.keyboardAliveAt)
     }
 }

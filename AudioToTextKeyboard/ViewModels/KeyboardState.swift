@@ -22,13 +22,24 @@ final class KeyboardState: ObservableObject {
         category: "KeyboardState"
     )
 
-    enum Phase: Equatable {
+    enum Phase: Equatable, CustomStringConvertible {
         case idle
         case starting
         case recording
         case transcribing
         case ready
         case failed(String)
+
+        var description: String {
+            switch self {
+            case .idle: return "idle"
+            case .starting: return "starting"
+            case .recording: return "recording"
+            case .transcribing: return "transcribing"
+            case .ready: return "ready"
+            case .failed(let message): return "failed(\(message))"
+            }
+        }
     }
 
     // MARK: - Published state
@@ -67,7 +78,8 @@ final class KeyboardState: ObservableObject {
     private var elapsedTimer: Timer?
     private var insertedFinalText = false
     private var lastLiveText = ""
-    private var lastActivityDate: Date?
+    /// Throttle for the presence beacon (the app's orphan finalizer reads it).
+    private var lastPresenceWrite: Date = .distantPast
     /// True while the keyboard is on screen. Inserts are only attempted when
     /// visible — a `.ready` polled during the dismissal transition would
     /// otherwise insert into a detached input session and lose the text.
@@ -89,7 +101,6 @@ final class KeyboardState: ObservableObject {
     /// recently) running" — trust the Darwin wake instead of cold-launching.
     private let coldLaunchDelayWhenAppKnown: TimeInterval = 4.0
     private let startTimeout: TimeInterval = 10
-    private let idleTimeout: TimeInterval = 30
     /// Generous on purpose: the app's own finalize watchdog is ~3s, so this
     /// must never race it.
     private let transcribeTimeout: TimeInterval = 25
@@ -134,9 +145,14 @@ final class KeyboardState: ObservableObject {
 
     func startDictation() {
         switch phase {
-        case .idle, .failed:
+        case .idle, .failed, .starting:
+            // `.starting` too: tapping the mic again while a request is
+            // pending writes a FRESH session + generation. That is the
+            // keyboard's guaranteed reset — the app treats any newer
+            // request as a preemption of whatever it is stuck on, so a
+            // wedged app heals on the very next tap.
             break
-        default:
+        case .recording, .transcribing, .ready:
             return
         }
         guard hasFullAccess else {
@@ -169,8 +185,11 @@ final class KeyboardState: ObservableObject {
         let defaults = AppGroup.defaults
         DictationSharedState.reset(defaults: defaults)
         defaults.set(myToken, forKey: DictationSharedState.Key.sessionToken)
+        // The keyboard's OWN clock. Every timeout that matters — our
+        // `.starting` timeout and the app's request TTL — reads this, so a
+        // wedged app can never keep a dead request alive.
+        defaults.set(Date.timeIntervalSinceReferenceDate, forKey: DictationSharedState.Key.requestedAt)
         DictationSharedState.setStatus(.requested, defaults: defaults)
-        lastActivityDate = DictationSharedState.lastActivityDate
         Self.logger.info("startDictation: requested (token \(self.myToken.prefix(8)))")
 
         DarwinNotifications.post()
@@ -197,7 +216,7 @@ final class KeyboardState: ObservableObject {
         case .recording:
             phase = .transcribing
             let defaults = AppGroup.defaults
-            defaults.set(true, forKey: DictationSharedState.Key.stopRequested)
+            DictationSharedState.requestStop(for: myToken, defaults: defaults)
             DictationSharedState.touchActivity(defaults: defaults)
             DarwinNotifications.post()
             // Bounded wait for the app to finish.
@@ -238,8 +257,13 @@ final class KeyboardState: ObservableObject {
         stopPolling()
         let defaults = AppGroup.defaults
         let current = DictationSharedState.status(defaults)
-        if current == .requested || current == .recording {
-            defaults.set(true, forKey: DictationSharedState.Key.cancelRequested)
+        if current == .requested || current == .recording || current == .transcribing {
+            // Cancel whatever session the store currently names — that is
+            // the session the app is (or will be) serving. `.transcribing`
+            // too: a cancel during finalizing must abort, not leave a
+            // `.ready` that surprise-inserts later.
+            let target = DictationSharedState.sessionToken(defaults)
+            DictationSharedState.requestCancel(for: target, defaults: defaults)
             DictationSharedState.touchActivity(defaults: defaults)
             DarwinNotifications.post()
         } else if current == .ready {
@@ -281,10 +305,14 @@ final class KeyboardState: ObservableObject {
         stopPolling()
         if appWasAliveAtStart {
             // The app is alive in the background: it WILL adopt the request,
-            // so tell it the user walked away.
+            // so tell it the user walked away. Cancel whatever the store
+            // names — if the app already adopted our request, that session
+            // must not record into a void (the orphan that wedges the app).
             let defaults = AppGroup.defaults
-            if DictationSharedState.status(defaults) == .requested {
-                defaults.set(true, forKey: DictationSharedState.Key.cancelRequested)
+            let shared = DictationSharedState.status(defaults)
+            if shared == .requested || shared == .recording {
+                let target = DictationSharedState.sessionToken(defaults)
+                DictationSharedState.requestCancel(for: target, defaults: defaults)
                 DictationSharedState.touchActivity(defaults: defaults)
                 DarwinNotifications.post()
             }
@@ -297,25 +325,36 @@ final class KeyboardState: ObservableObject {
     /// to the live session or insert immediately if it already finished.
     func recoverKeyboardSession() {
         refreshFullAccessStatus()
+        // An overlay phase is a LIVE, visible session — leave it alone. All
+        // other phases (including `.starting`: we may have been suspended
+        // mid-start with dead timers) re-evaluate the shared state below.
         switch phase {
-        case .idle, .failed:
+        case .idle, .failed, .starting:
             break
-        default:
+        case .recording, .transcribing, .ready:
             return
         }
         let defaults = AppGroup.defaults
         let status = DictationSharedState.status(defaults)
-        Self.logger.info("recoverKeyboardSession: shared status=\(status.rawValue)")
+        Self.logger.info("recoverKeyboardSession: phase=\(self.phase) shared=\(status.rawValue)")
 
         switch status {
         case .requested:
-            // Our request is still pending (we died before the app adopted).
+            // A request is still pending (we died/slept before the app
+            // adopted). Adopt it and resume with a FRESH request clock —
+            // both our timeout and the app's TTL read it, so a resumed
+            // request gets its full timeout instead of failing on a stale
+            // timestamp from before the suspension.
             myToken = DictationSharedState.sessionToken(defaults)
+            guard !myToken.isEmpty else {
+                resetToIdle()
+                return
+            }
+            defaults.set(Date.timeIntervalSinceReferenceDate, forKey: DictationSharedState.Key.requestedAt)
             sessionGeneration += 1
             let generation = sessionGeneration
             insertedFinalText = false
             phase = .starting
-            lastActivityDate = DictationSharedState.lastActivityDate
             startPolling(generation: generation)
             // Nudge the app again: if it's alive in the background (its
             // silent keep-alive) it adopts instantly — no cold-launch, no
@@ -331,12 +370,13 @@ final class KeyboardState: ObservableObject {
                 self.openURL?(URL(string: "attotext://dictate")!)
             }
         case .recording, .transcribing:
+            // The app adopted our request (or an orphan session) while we
+            // slept — resume watching it and keep it alive via presence.
             sessionGeneration += 1
             let generation = sessionGeneration
             myToken = DictationSharedState.sessionToken(defaults)
             insertedFinalText = false
             phase = (status == .recording) ? .recording : .transcribing
-            lastActivityDate = DictationSharedState.lastActivityDate
             liveTranscript = DictationSharedState.liveText(defaults)
             lastLiveText = liveTranscript
             audioLevel = DictationSharedState.audioLevel(defaults)
@@ -372,7 +412,11 @@ final class KeyboardState: ObservableObject {
             DictationSharedState.setStatus(.idle, defaults: defaults)
             fail(message.isEmpty ? "Dictation failed." : message)
         case .idle:
-            break
+            if phase == .starting {
+                // We were starting but the app (or a reset) cleared the
+                // request while we slept — don't sit on a dead `.starting`.
+                fail("Dictation isn't connected. Make sure the app is installed and open it once, then try again.")
+            }
         }
     }
 
@@ -417,18 +461,35 @@ final class KeyboardState: ObservableObject {
         pollTimer = nil
     }
 
+    /// Marks the keyboard present for the app's orphan finalizer (a
+    /// backgrounded keyboard session whose presence goes stale gets
+    /// finalized by the app). Throttled: shared-defaults writes every poll
+    /// tick are wasteful, and 1s is far under the app's grace period.
+    private func touchPresence() {
+        let now = Date()
+        guard now.timeIntervalSince(lastPresenceWrite) >= 1 else { return }
+        lastPresenceWrite = now
+        DictationSharedState.touchKeyboardPresence()
+    }
+
     private func pollOnce(generation: Int) {
         guard generation == sessionGeneration else { return }
         let defaults = AppGroup.defaults
         let shared = DictationSharedState.status(defaults)
-        lastActivityDate = DictationSharedState.lastActivityDate
         audioLevel = DictationSharedState.audioLevel(defaults)
+        // Mark the keyboard present while it watches the session: the app
+        // finalizes an orphan session (keyboard died / user left) as soon
+        // as this goes stale.
+        touchPresence()
 
         switch shared {
         case .requested:
-            if phase == .starting, let last = lastActivityDate {
-                // The app never picked the request up.
-                if Date().timeIntervalSince(last) > startTimeout {
+            if phase == .starting,
+               let requestedAt = DictationSharedState.requestedAtDate(defaults) {
+                // Timeout from the KEYBOARD's own request clock — a wedged
+                // app cannot refresh this, so it always fires and the UI
+                // can never hang on "Starting…" forever.
+                if Date().timeIntervalSince(requestedAt) > startTimeout {
                     fail("Dictation isn't connected. Make sure the app is installed and open it once, then try again.")
                 }
             }
@@ -445,11 +506,9 @@ final class KeyboardState: ObservableObject {
                 return
             }
             updateLiveText(DictationSharedState.liveText(defaults))
-            if let last = lastActivityDate, Date().timeIntervalSince(last) > idleTimeout {
-                // Long silence — wrap up so the session can't leak.
-                Self.logger.info("pollOnce: idle \(self.idleTimeout)s — auto-stopping")
-                stopDictation()
-            }
+            // No keyboard-side idle auto-stop: the app owns timeouts now
+            // (real-speech idle, keyboard presence, session cap) and
+            // publishes `.ready` itself; we just insert it.
         case .transcribing:
             phase = .transcribing
             // The app is finalizing; its session loop keeps the heartbeat
@@ -557,8 +616,26 @@ final class KeyboardState: ObservableObject {
         }
     }
 
+    /// The keyboard is giving up on the session currently in the store
+    /// (timeout, app death, full-access refusal). Tag-cancel it so the app
+    /// can never adopt/keep recording into a void after the keyboard walked
+    /// away. No-op when the store holds no live session.
+    private func abandonSharedSession() {
+        let defaults = AppGroup.defaults
+        let shared = DictationSharedState.status(defaults)
+        guard shared == .requested || shared == .recording || shared == .transcribing else { return }
+        let target = DictationSharedState.sessionToken(defaults)
+        guard !target.isEmpty else { return }
+        DictationSharedState.requestCancel(for: target, defaults: defaults)
+        DictationSharedState.touchActivity(defaults: defaults)
+        DarwinNotifications.post()
+    }
+
     private func fail(_ message: String) {
         Self.logger.error("fail: \(message)")
+        // This keyboard session is over — make sure the app never keeps the
+        // underlying shared session running for nobody.
+        abandonSharedSession()
         // Copy the error to the pasteboard so the user can paste it back to
         // the developer without typing it.
         let shared = DictationSharedState.status()
