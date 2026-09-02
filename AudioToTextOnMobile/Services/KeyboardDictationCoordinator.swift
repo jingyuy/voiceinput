@@ -39,6 +39,12 @@ final class KeyboardDictationCoordinator {
     /// Absolute session-length cap — no session can ever run forever, even
     /// if every other timeout is defeated.
     static let maxSessionDuration: TimeInterval = 240
+    /// If the finish watchdog Task is lost (preempted, or the process was
+    /// suspended across its window), the session loop re-drives
+    /// `finishAndPublish` once a session has been finalizing this long — so
+    /// the keyboard can never hang on "Finalizing…" while we hold `.ready`
+    /// text it can already insert.
+    static let finishRedriveAfter: TimeInterval = 5
 
     // MARK: - Published state (drives the app's own overlay UI)
 
@@ -76,6 +82,15 @@ final class KeyboardDictationCoordinator {
     private var lastSpeechAt = Date()
     /// When the current session started — base of the absolute cap.
     private var sessionStartedAt = Date()
+    /// When the current finalize began — base of the re-drive that
+    /// guarantees `.ready` is eventually published.
+    private var transcribingAt = Date()
+    /// The last non-empty text heard this session (partial or final). The
+    /// recognizer can finalize trailing silence with an EMPTY result that
+    /// otherwise wipes `liveText` — the only copy of words the user saw.
+    /// `finishAndPublish` / `finishAppSession` fall back to this so spoken
+    /// text is never published as empty.
+    private var lastHeardText = ""
     private var sessionLoopTask: Task<Void, Never>?
     private var finishWatchdog: Task<Void, Never>?
     private var armWatcherTask: Task<Void, Never>?
@@ -385,8 +400,10 @@ final class KeyboardDictationCoordinator {
         sessionStartedAt = Date()
         finalizedSegments = []
         liveText = ""
+        lastHeardText = ""
         finalText = ""
         errorMessage = nil
+        DictationSharedState.logTrace("app adopt session (token \(token.prefix(8)))")
         DictationSharedState.clearPayload()
         DictationSharedState.setStatus(.recording)
         startSessionLoop()
@@ -450,10 +467,12 @@ final class KeyboardDictationCoordinator {
         }
         finalizedSegments = []
         liveText = ""
+        lastHeardText = ""
         finalText = ""
         errorMessage = nil
         isFinishing = false
         stallReArmAttemptedAt = nil
+        DictationSharedState.logTrace("app preempted session")
         // Shared state is left alone — adoptSession rewrites it.
     }
 
@@ -491,6 +510,7 @@ final class KeyboardDictationCoordinator {
         sessionStartedAt = Date()
         finalizedSegments = []
         liveText = ""
+        lastHeardText = ""
         finalText = ""
         errorMessage = nil
         token = ""
@@ -543,10 +563,7 @@ final class KeyboardDictationCoordinator {
         guard isActive, isAppSession, isFinishing else { return }
         finishWatchdog?.cancel()
         isFinishing = false
-        let text = (finalizedSegments + [liveText])
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = sessionCollectedText()
         finalizedSegments = text.isEmpty ? [] : [text]
         liveText = ""
         status = .idle
@@ -611,6 +628,8 @@ final class KeyboardDictationCoordinator {
     func beginFinish() {
         guard isActive, !isFinishing, DictationSharedState.status() == .recording else { return }
         isFinishing = true
+        transcribingAt = Date()
+        DictationSharedState.logTrace("app beginFinish live=\"\(self.liveText.prefix(80))\" segs=\(self.finalizedSegments.count)")
         DictationSharedState.setStatus(.transcribing)
         // IMPORTANT: do NOT stop the capture engine here. UIBackgroundModes
         // audio only keeps this process alive while its audio session is
@@ -638,6 +657,7 @@ final class KeyboardDictationCoordinator {
         guard isActive else { return }
         stopSessionLoop()
         finishWatchdog?.cancel()
+        DictationSharedState.logTrace("app cancelSession")
         // The capture engine stays armed (always-on mic) — never stop it.
         speechService.cancelSession()
         finalizedSegments = []
@@ -660,14 +680,30 @@ final class KeyboardDictationCoordinator {
         standDown()
     }
 
+    /// The collected text of the current session: finalized segments plus
+    /// the pending partial. Falls back to `lastHeardText` when `liveText`
+    /// was cleared without the words reaching a segment (the recognizer's
+    /// empty silence-final) — so a publish is never empty if words were
+    /// actually spoken.
+    private func sessionCollectedText() -> String {
+        let segments = finalizedSegments.filter { !$0.isEmpty }
+        var pending = liveText
+        if pending.isEmpty, !lastHeardText.isEmpty, lastHeardText != segments.last {
+            pending = lastHeardText
+        }
+        return (segments + (pending.isEmpty ? [] : [pending]))
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func finishAndPublish() {
         guard isActive else { return }
         finishWatchdog?.cancel()
         isFinishing = false
-        let text = (finalizedSegments + [liveText])
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = sessionCollectedText()
+        DictationSharedState.logTrace(text.isEmpty
+            ? "app publish EMPTY (live=\"\(liveText)\" lastHeard=\"\(lastHeardText)\" segs=\(finalizedSegments.count))"
+            : "app publish len=\(text.count)")
         let defaults = AppGroup.defaults
         // Write the result BEFORE stopping capture: `captureService.stop()`
         // deactivates the audio session, and in the background that can
@@ -806,11 +842,19 @@ final class KeyboardDictationCoordinator {
             }
         case .transcribing:
             // The user cancelled while we were finalizing — abort (the
-            // keyboard shows ✕ during this phase too). Otherwise: waiting
-            // on the recognizer — the finish watchdog owns this.
+            // keyboard shows ✕ during this phase too). Otherwise the finish
+            // watchdog owns the publish — unless it was lost (task
+            // preempted, process suspended past its window): then re-drive
+            // the publish here so a wedged finalize can't strand the
+            // keyboard on "Finalizing…" forever.
             if DictationSharedState.cancelRequested(for: token, defaults: defaults) {
                 Self.logger.info("cancel requested during finalizing — aborting session")
                 cancelSession()
+            } else if isFinishing,
+                      Date().timeIntervalSince(transcribingAt) > Self.finishRedriveAfter {
+                Self.logger.warning("finalize stuck >\(Self.finishRedriveAfter)s — re-driving finishAndPublish")
+                DictationSharedState.logTrace("app re-drive finishAndPublish")
+                finishAndPublish()
             } else {
                 break
             }
@@ -840,9 +884,18 @@ final class KeyboardDictationCoordinator {
     private func wireCallbacks() {
         speechService.onTranscriptUpdate = { [weak self] text in
             guard let self else { return }
-            self.liveText = text
             // A transcript change is real speech by definition.
             if self.isActive { self.lastSpeechAt = Date() }
+            if text.isEmpty, self.isActive, !self.liveText.isEmpty {
+                // The recognizer cleared the pending partial WITHOUT a
+                // finalized segment (a silence auto-final). The words were
+                // only ever in liveText — keep them in lastHeardText so a
+                // later publish can't come out empty.
+                DictationSharedState.logTrace("app liveText CLEARED without segment (was \"\(self.liveText.prefix(80))\")")
+            } else if !text.isEmpty, self.isActive {
+                self.lastHeardText = text
+            }
+            self.liveText = text
             // App-side sessions must not pollute the shared keyboard protocol.
             guard !self.isAppSession else { return }
             let defaults = AppGroup.defaults
@@ -852,6 +905,7 @@ final class KeyboardDictationCoordinator {
         speechService.onSegmentFinalized = { [weak self] text in
             guard let self else { return }
             self.finalizedSegments.append(text)
+            DictationSharedState.logTrace("app segment final (len \(text.count)) — segs=\(self.finalizedSegments.count)")
             self.liveText = ""
             if self.isActive { self.lastSpeechAt = Date() }
             if !self.isAppSession {

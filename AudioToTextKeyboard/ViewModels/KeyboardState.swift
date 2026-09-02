@@ -219,33 +219,47 @@ final class KeyboardState: ObservableObject {
             DictationSharedState.requestStop(for: myToken, defaults: defaults)
             DictationSharedState.touchActivity(defaults: defaults)
             DarwinNotifications.post()
-            // Bounded wait for the app to finish.
-            finishWatchdog?.cancel()
-            finishWatchdog = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(self?.transcribeTimeout ?? 25))
-                guard let self, !Task.isCancelled else { return }
-                guard case .transcribing = self.phase else { return }
-                // Before giving up, re-check the shared state: the app may
-                // have published `.ready` just past our check.
-                let defaults = AppGroup.defaults
-                let shared = DictationSharedState.status(defaults)
-                if shared == .ready {
-                    let text = DictationSharedState.finalText(defaults)
-                    if !text.isEmpty {
-                        self.insertedFinalText = true
-                        self.finalText = text
-                        self.needsManualInsert = false
-                        Self.logger.info("stopDictation watchdog: late .ready — inserting final text")
-                        self.insertAndVerify(text)
-                        return
-                    }
-                }
-                self.fail("Speech recognition timed out.")
-            }
+            DictationSharedState.logTrace("kb stop tap (live=\"\(DictationSharedState.liveText(defaults).prefix(80))\")", defaults: defaults)
+            // Bounded wait for the app to finish (re-armed if this process
+            // respawns while still finalizing — see armFinishWatchdog).
+            armFinishWatchdog()
         case .starting:
             cancelDictation()
         default:
             break
+        }
+    }
+
+    /// Arms the bounded wait for the app to finish finalizing. After
+    /// `transcribeTimeout` with no `.ready` the session fails — but a late
+    /// `.ready` just past our poll is honored before giving up. Called from
+    /// `stopDictation`, and re-armed whenever the keyboard finds itself
+    /// watching `.transcribing` without a watchdog (process respawn via
+    /// `recoverKeyboardSession` / `pollOnce`), so "Finalizing…" can never
+    /// outlive the timeout.
+    private func armFinishWatchdog() {
+        finishWatchdog?.cancel()
+        finishWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(self?.transcribeTimeout ?? 25))
+            guard let self, !Task.isCancelled else { return }
+            guard case .transcribing = self.phase else { return }
+            // Before giving up, re-check the shared state: the app may have
+            // published `.ready` just past our check.
+            let defaults = AppGroup.defaults
+            let shared = DictationSharedState.status(defaults)
+            if shared == .ready {
+                let text = DictationSharedState.finalText(defaults)
+                if !text.isEmpty {
+                    self.insertedFinalText = true
+                    self.finalText = text
+                    self.needsManualInsert = false
+                    Self.logger.info("finish watchdog: late .ready — inserting final text")
+                    self.insertAndVerify(text)
+                    return
+                }
+            }
+            DictationSharedState.logTrace("kb finish watchdog gave up (shared=\(shared.rawValue))", defaults: defaults)
+            self.fail("Speech recognition timed out.")
         }
     }
 
@@ -382,6 +396,11 @@ final class KeyboardState: ObservableObject {
             audioLevel = DictationSharedState.audioLevel(defaults)
             startElapsedTimer()
             startPolling(generation: generation)
+            if status == .transcribing {
+                // A process respawn must not lose the finish timeout — the
+                // only escape from a stuck "Finalizing…".
+                armFinishWatchdog()
+            }
         case .ready:
             // Only auto-insert a FRESH result. A `.ready` that has been
             // sitting in the shared store for a long time (app was
@@ -517,6 +536,11 @@ final class KeyboardState: ObservableObject {
                 fail("The app closed while finalizing. Open it once, then try again.")
                 return
             }
+            // Defensive: any path into `.transcribing` without a finish
+            // watchdog gets one, so "Finalizing…" is always bounded.
+            if finishWatchdog == nil {
+                armFinishWatchdog()
+            }
         case .ready:
             guard isVisible else { return }
             let text = DictationSharedState.finalText(defaults)
@@ -536,7 +560,13 @@ final class KeyboardState: ObservableObject {
                 // The app reset the request (it cancelled immediately).
                 fail("Dictation isn't connected. Make sure the app is installed and open it once, then try again.")
             } else if phase == .recording || phase == .transcribing {
-                // The app ended the session without delivering text.
+                // The app ended the session WITHOUT publishing text — this
+                // is the silent text-loss path (no .ready, no error). Copy
+                // a diagnostic so the occurrence can be diagnosed from the
+                // pasteboard.
+                Self.logger.error("silent session end from \(self.phase) with no text")
+                DictationSharedState.logTrace("kb silent idle from \(self.phase)", defaults: defaults)
+                copyDiagnostics(reason: "silent idle from \(self.phase) — no text published")
                 resetToIdle()
             }
         }
@@ -631,23 +661,31 @@ final class KeyboardState: ObservableObject {
         DarwinNotifications.post()
     }
 
-    private func fail(_ message: String) {
-        Self.logger.error("fail: \(message)")
-        // This keyboard session is over — make sure the app never keeps the
-        // underlying shared session running for nobody.
-        abandonSharedSession()
-        // Copy the error to the pasteboard so the user can paste it back to
-        // the developer without typing it.
+    /// Writes the keyboard + shared diagnostic to the pasteboard (the user
+    /// can paste it back). Includes the tail of the shared ring trace so a
+    /// silent text loss shows exactly what the app did.
+    private func copyDiagnostics(reason: String) {
         let shared = DictationSharedState.status()
         let dump = """
-        [AudioToTextKeyboard] \(message)
+        [AudioToTextKeyboard] \(reason)
         phase=\(phase)
         sharedStatus=\(shared.rawValue)
         token=\(myToken.prefix(8))
         lastActivity=\(DictationSharedState.lastActivityDate.map { String(format: "%.1fs ago", Date().timeIntervalSince($0)) } ?? "nil")
         appHeartbeat=\(DictationSharedState.appHeartbeatDate.map { String(format: "%.1fs ago", Date().timeIntervalSince($0)) } ?? "nil")
+        trace=\(DictationSharedState.traceTail())
         """
         UIPasteboard.general.string = dump
+    }
+
+    private func fail(_ message: String) {
+        Self.logger.error("fail: \(message)")
+        // This keyboard session is over — make sure the app never keeps the
+        // underlying shared session running for nobody.
+        abandonSharedSession()
+        // Copy the error (plus the shared trace) to the pasteboard so the
+        // user can paste it back to the developer without typing it.
+        copyDiagnostics(reason: message)
         watchdogTask?.cancel()
         finishWatchdog?.cancel()
         stopPolling()

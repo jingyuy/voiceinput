@@ -57,6 +57,10 @@ enum DictationSharedState {
         /// Timestamp (ref date) when the app published `.ready` — the
         /// keyboard's freshness gate for auto-inserting a result.
         static let readyAt = "dictation.readyAt"
+        /// Ring trace appended by BOTH processes (newest last, capped) for
+        /// diagnosing silent text loss without console access. Never
+        /// cleared by `reset` — it must survive sessions.
+        static let appTrace = "dictation.trace"
     }
 
     // MARK: - Reads
@@ -189,6 +193,26 @@ enum DictationSharedState {
 
     static func touchActivity(defaults: UserDefaults = AppGroup.defaults) {
         defaults.set(Date.timeIntervalSinceReferenceDate, forKey: Key.lastActivity)
+    }
+
+    /// Appends `event` (timestamped) to the shared ring trace, capped at
+    /// ~4 KB (newest kept). Written by both the app and the keyboard at
+    /// session milestones so an end-of-session dump can show what actually
+    /// happened. Deliberately NOT cleared by `reset`.
+    static func logTrace(_ event: String, defaults: UserDefaults = AppGroup.defaults) {
+        let line = "\(String(format: "%.0f", Date.timeIntervalSinceReferenceDate)) \(event)\n"
+        var trace = (defaults.string(forKey: Key.appTrace) ?? "") + line
+        if trace.count > 4000 {
+            trace = String(trace.suffix(4000))
+        }
+        defaults.set(trace, forKey: Key.appTrace)
+    }
+
+    /// The newest tail of the ring trace (for pasteboard dumps).
+    static func traceTail(_ max: Int = 1400, defaults: UserDefaults = AppGroup.defaults) -> String {
+        let trace = defaults.string(forKey: Key.appTrace) ?? ""
+        guard trace.count > max else { return trace }
+        return String(trace.suffix(max))
     }
 
     /// The keyboard asks the app to finalize (stop) session `token`.
