@@ -31,9 +31,17 @@ struct RecordingOverlayView: View {
                     .frame(width: 8, height: 8)
                     .shadow(color: .red.opacity(0.8), radius: 4)
             }
-            Text(title)
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                // The globe key only has room for a short code ("EN") — spell
+                // out the dictation language here while the session is live.
+                Text(DictationSettings.shared.localeName)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
             Spacer()
             Text(timeString(state.elapsed))
                 .font(.footnote.monospacedDigit())
