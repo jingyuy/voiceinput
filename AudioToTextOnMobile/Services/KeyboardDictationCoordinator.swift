@@ -95,8 +95,37 @@ final class KeyboardDictationCoordinator {
     private var finishWatchdog: Task<Void, Never>?
     private var armWatcherTask: Task<Void, Never>?
     private var darwinObservation: DarwinNotifications.Observation?
+    /// When the arm-watcher last tried to swap the silent keepalive back to
+    /// an armed microphone from the background — a refused start ('!int') is
+    /// throttled so it can't churn the session every tick.
+    private var lastKeepAliveReArmAttempt = Date.distantPast
+    /// Set while an `ensureMicArmed` task is running/scheduled so bursts of
+    /// triggers (each category change posts a route notification, each of
+    /// which can call `ensureMicArmed`) coalesce into ONE arm instead of a
+    /// stack of tasks that force-stop each other's fresh engines.
+    private var micArmInFlight = false
+    /// Counts arm-watcher ticks observed while the app is backgrounded.
+    /// Diagnostic only: a gap in `diag.log`'s "BG watcher alive" lines
+    /// pinpoints when the process was suspended.
+    /// Set while a foreign app owns the audio session and we have stepped
+    /// aside in the background: interruption `.began`, OR foreign audio
+    /// detected while strictly backgrounded with no engine we can start
+    /// (starting ANY audio engine in the background fails '!int' 560557684 —
+    /// a video app that merely launched can flip `isOtherAudioPlaying`
+    /// without ever sending `.began`). Cleared when the owner releases
+    /// (`.ended`), when we return to the foreground, or on a cold-launch.
+    /// While set and strictly backgrounded, every idle engine start is
+    /// suppressed: re-arming against an owner that won't yield cycles
+    /// `.began` → re-arm → `.began` (or one refused start per 5 s tick) in
+    /// the background, and the watchdog kills an app that churns the audio
+    /// session like that. Live dictation is unaffected (its interruption
+    /// path finalizes normally).
+    private var sessionStolenByForeignApp = false
+    private var backgroundWatcherTicks = 0
 
     private init() {
+        DictationSharedState.diagClear()
+        DictationSharedState.diag("=== app process started ===")
         darwinObservation = DarwinNotifications.observe { [weak self] in
             Task { @MainActor in self?.handlePing() }
         }
@@ -121,26 +150,58 @@ final class KeyboardDictationCoordinator {
     /// by the keyboard) — the ONLY way to wake a suspended app.
     func noteOpenURL() {
         isColdStart = true
+        // Foregrounded via the keyboard — whatever foreign app held the
+        // session earlier is no longer an obstacle; arming is allowed again.
+        sessionStolenByForeignApp = false
+        // The keyboard just brought us to the foreground — drop the silent
+        // keepalive (only needed while backgrounded) so the mic can arm, or
+        // a dictation request can start capture over the music.
+        if captureService.isKeepingAlive {
+            captureService.stopKeepAlive()
+        }
         ensureMicArmed()
         Task { await checkRequested() }
     }
 
     /// Called by the app on scene-phase changes.
     func handleScenePhase(_ phase: ScenePhase) {
+        let phaseLabel: String
+        switch phase {
+        case .active: phaseLabel = "active"
+        case .inactive: phaseLabel = "inactive"
+        case .background: phaseLabel = "background"
+        @unknown default: phaseLabel = "unknown"
+        }
+        DictationSharedState.diag("scenePhase \(phaseLabel): running=\(captureService.isRunning) keepalive=\(captureService.isKeepingAlive) otherAudio=\(otherAudioPlaying) appState=\(UIApplication.shared.applicationState.rawValue) dictating=\(isActive)")
         switch phase {
         case .active:
             if !isActive { isColdStart = false }
+            // Foreground again: if a foreign app had taken the audio session
+            // while we were backgrounded, the mic may now be re-armed freely.
+            if sessionStolenByForeignApp {
+                DictationSharedState.diag("scene .active — foreign-owner hold released")
+            }
+            sessionStolenByForeignApp = false
             // Heartbeat + always-armed mic: keep the input unit initialized
             // while we're visible so dictation can start instantly later,
             // even from the background.
             DictationSharedState.touchActivity()
             if !isActive, !isAppSession {
+                if captureService.isKeepingAlive {
+                    // Foreground again — the silent keepalive existed only to
+                    // keep the BACKGROUND process alive. Drop it; the mic is
+                    // re-armed below (unless another app is still playing —
+                    // ensureMicArmed yields to it).
+                    captureService.stopKeepAlive()
+                }
                 if captureService.isRunning {
                     // A session may have been stolen while we were away
-                    // (media reset, route change, an old second engine) —
-                    // recover immediately instead of waiting for the
-                    // arm-watcher.
-                    if !captureService.hasRecentBuffers(within: 5) {
+                    // (media reset, route change, an old second engine).
+                    // Recover it ONLY if it is genuinely stale: a healthy
+                    // fresh engine cannot have delivered buffers yet (first
+                    // buffer takes tens of ms), so force-re-arming it here
+                    // would re-trigger the self-sustaining churn loop.
+                    if armedEngineIsStale {
                         forceReArm()
                     }
                 } else {
@@ -161,6 +222,30 @@ final class KeyboardDictationCoordinator {
             // from the background is impossible, so recovery happens via the
             // arm-watcher / interruption-ended / route callbacks.
             if captureService.isRunning {
+                if !isActive, otherAudioPlaying {
+                    // Leaving the foreground while another app plays audio
+                    // (e.g. switching to Music): yield immediately — hot-swap
+                    // capture to a SILENT session so their playback is
+                    // pristine while this process stays alive.
+                    yieldMicToOtherAudio()
+                }
+                // else: armed with nothing else playing (or a live session)
+                // — the running engine keeps this process alive; nothing to do.
+            } else if captureService.isKeepingAlive {
+                // Silent keepalive holds (music playing). If their audio
+                // stops, the arm-watcher hot-swaps back to the mic within
+                // ~10s — no deactivation, no suspension window.
+            } else if otherAudioPlaying {
+                // Nothing armed (launched over music, or music started while
+                // nothing was running) — enter the silent keepalive so a
+                // backgrounded app isn't suspended while their audio plays.
+                ensureKeepAlive()
+            } else {
+                // Bare with nothing playing: arm before we fully leave the
+                // foreground. The session may be active with no engine (a
+                // foreground yield left it that way) — an active-but-idle
+                // session does NOT prevent suspension, so we must be running
+                // an engine before the app can be suspended.
                 ensureMicArmed()
             }
         @unknown default:
@@ -188,23 +273,64 @@ final class KeyboardDictationCoordinator {
         }
     }
 
+    /// The armed capture engine started less than 3 s ago and is actually
+    /// running. Such an engine is UNJUDGEABLE by buffers (the first PCM
+    /// buffer takes tens of ms after `start()`), so no caller may rebuild it
+    /// — rebuilding posts a category-change route notification, which
+    /// re-triggers the rebuild, which … the infinite churn that
+    /// watchdog-kills a backgrounded app.
+    private var armedEngineIsFresh: Bool {
+        captureService.isRunning
+            && captureService.engineActuallyRunning
+            && Date().timeIntervalSince(captureService.lastEngineStartAt) < 3
+    }
+
+    /// The armed engine is genuinely dead or starved: not actually running,
+    /// or running for >5 s without delivering a single buffer.
+    private var armedEngineIsStale: Bool {
+        captureService.isRunning && !armedEngineIsFresh && (
+            !captureService.engineActuallyRunning
+                || !captureService.hasRecentBuffers(within: 5)
+        )
+    }
+
     /// Keeps the capture engine running at all times (while the app is alive
     /// and no session is active) so that a dictation request can be adopted
     /// in the background WITHOUT initializing the input unit. iOS refuses to
     /// START mic capture in the background (AURemoteIO '!int' 560557684), but
     /// a capture session started in the foreground keeps running there.
     ///
-    /// `force` tears the engine down first (interruption-ended, route
+    /// `force` tears a STALE engine down first (interruption-ended, route
     /// change, media reset, arm-watcher): `isRunning` can be stale-true on a
-    /// dead engine, so the normal guard would never re-arm it.
+    /// dead engine, so the normal guard would never re-arm it. A fresh,
+    /// healthy engine is NEVER touched, and concurrent triggers coalesce
+    /// into one arm (see `micArmInFlight`).
     private func ensureMicArmed(force: Bool = false) {
         guard !isActive, !isAppSession else { return }
+        guard !micArmInFlight else { return }
+        // Yield to another app that is actively playing audio: our armed
+        // session would silence (.record) or degrade (.playAndRecord) it.
+        // The mic re-arms when their audio stops (arm-watcher / next scene
+        // .active / route change); a dictation request still takes priority
+        // because startAudio() arms directly without going through here.
+        guard !otherAudioPlaying else { return }
+        // A foreign app took the session and hasn't released it — do not
+        // re-arm over it from the background (churn = watchdog kill).
+        guard !isAppBackground || !sessionStolenByForeignApp else { return }
+        if armedEngineIsFresh { return }
         if !force, captureService.isRunning { return }
+        micArmInFlight = true
         Task { @MainActor in
+            defer { self.micArmInFlight = false }
             guard !self.isActive, !self.isAppSession else { return }
+            // Re-check: music may have started — or a foreign app stolen the
+            // session — while we awaited below.
+            guard !self.otherAudioPlaying else { return }
+            guard !self.isAppBackground || !self.sessionStolenByForeignApp else { return }
+            if self.armedEngineIsFresh { return }
             if !force, self.captureService.isRunning { return }
-            if force, self.captureService.isRunning {
-                self.captureService.stop()
+            if force, self.captureService.isRunning, !self.armedEngineIsFresh {
+                self.captureService.stopCaptureKeepingSession()
             }
             if AVAudioApplication.shared.recordPermission == .undetermined && !self.isAppForeground {
                 // The permission prompt can only be shown in the foreground.
@@ -220,6 +346,7 @@ final class KeyboardDictationCoordinator {
             do {
                 try self.captureService.start()
                 DictationSharedState.touchAppHeartbeat()
+                DictationSharedState.diag("mic armed — background dictation ready")
                 Self.logger.info("mic armed — background dictation ready")
             } catch {
                 Self.logger.error("ensureMicArmed failed: \(AudioCaptureService.errorDetail(error, copyToPasteboard: false))")
@@ -227,15 +354,37 @@ final class KeyboardDictationCoordinator {
         }
     }
 
-    /// Tears down a broken engine and re-arms it (used when the system took
+    /// Tears down a BROKEN engine and re-arms it (used when the system took
     /// the mic away: interruption-ended, route change, media services reset).
     /// Only meaningful while IDLE — during a live session the session-loop
-    /// stall detection owns recovery (see `handleSessionStall`).
+    /// stall detection owns recovery (see `handleSessionStall`). Never
+    /// deactivates the session: if we're in keepalive it is hot-swapped to
+    /// capture; if capture is running the engine is stopped session-active
+    /// and restarted via `ensureMicArmed`. A fresh, healthy engine is never
+    /// touched (see `armedEngineIsFresh`).
     private func forceReArm() {
-        if captureService.isRunning {
-            captureService.stop()
+        DictationSharedState.diag("forceReArm: keepalive=\(captureService.isKeepingAlive) running=\(captureService.isRunning)")
+        if isAppBackground, sessionStolenByForeignApp {
+            // The engine died because a foreign app owns the session — do
+            // NOT re-arm over it (each background re-arm against an owner
+            // that won't yield is another churn cycle the watchdog counts).
+            // Release what's left and wait for `.ended` / foreground.
+            DictationSharedState.diag("forceReArm deferred — foreign session owner")
+            captureService.releaseEnginesForForeignOwner()
+            return
         }
-        ensureMicArmed(force: true)
+        if captureService.isKeepingAlive {
+            attemptReArmFromKeepAlive()
+        } else {
+            if armedEngineIsFresh {
+                DictationSharedState.diag("forceReArm skipped — engine fresh (giving it time to deliver)")
+                return
+            }
+            if captureService.isRunning {
+                captureService.stopCaptureKeepingSession()
+            }
+            ensureMicArmed(force: true)
+        }
     }
 
     /// The capture engine stopped delivering buffers mid-session (route
@@ -270,16 +419,178 @@ final class KeyboardDictationCoordinator {
     /// new buffers; the old tap's buffers were already lost.
     private func restartCaptureDuringSession() {
         if captureService.isRunning {
-            captureService.stop()
+            captureService.stopCaptureKeepingSession()
         }
         Task { @MainActor in
             guard self.isActive else { return }
             do {
                 try self.captureService.start()
+                // A fresh engine start resets the session to its default
+                // (mixing) options — re-apply ducking while we're live.
+                self.captureService.setOtherAudioDucked(true)
                 Self.logger.info("capture re-armed during session")
             } catch {
                 Self.logger.error("session re-arm failed: \(AudioCaptureService.errorDetail(error, copyToPasteboard: false))")
             }
+        }
+    }
+
+    /// True when another app is currently playing audio (music, podcast,
+    /// video). Read on the main actor; cheap.
+    private var otherAudioPlaying: Bool {
+        AVAudioSession.sharedInstance().isOtherAudioPlaying
+    }
+
+    /// Another app started playing audio while we are idle. Give it the
+    /// hardware: hot-swap capture to a SILENT mixable session (see
+    /// `AudioCaptureService.yieldToKeepAlive`), so (1) their audio is
+    /// pristine — no `.record` silencing, no `.playAndRecord` voice-path
+    /// degradation — and (2) THIS process stays alive in the background. The
+    /// audio session is NEVER deactivated during the swap: a backgrounded
+    /// app whose session goes inactive is suspended, and repeated background
+    /// deactivate/reactivate cycles get the app watchdog-killed. The mic
+    /// re-arms when their audio stops (arm-watcher hot swap / scene .active)
+    /// or when dictation starts (startAudio arms directly). Only valid while
+    /// an engine can still be STARTED (foreground / scene transition) —
+    /// strictly-backgrounded callers use
+    /// `releaseForForeignAudioInBackground` instead.
+    private func yieldMicToOtherAudio() {
+        guard !isActive, !isAppSession, captureService.isRunning else { return }
+        Self.logger.info("yielding mic to other app audio — entering silent keepalive")
+        DictationSharedState.logTrace("app yield mic (keepalive)")
+        DictationSharedState.diag("policy: yield mic → silent keepalive")
+        // Age the heartbeat NOW so the keyboard cold-launches on its next
+        // request instead of waiting on a stale "alive" marker — a keepalive
+        // app has no capture running and cannot adopt a background request.
+        AppGroup.defaults.removeObject(forKey: DictationSharedState.Key.appHeartbeat)
+        captureService.yieldToKeepAlive()
+    }
+
+    /// A strictly-backgrounded app cannot hot-swap to the silent keepalive:
+    /// starting ANY audio engine in the background fails with '!int'
+    /// 560557684 (confirmed on device). When a foreign app owns or starts
+    /// using the audio while we are backgrounded, the only cooperative move
+    /// is to go QUIET — release every engine (their audio is then pristine),
+    /// age the heartbeat (the keyboard cold-launches/resumes us on its next
+    /// request), and latch so no idle tick tries to re-arm over the owner.
+    /// Each futile background engine start is a churn cycle the watchdog
+    /// counts — the "orange pill then app stops" kill. The latch is lifted
+    /// on interruption `.ended`, on scene `.active`, or on a cold-launch
+    /// URL, so the mic re-arms at the first legitimate moment.
+    private func releaseForForeignAudioInBackground(_ reason: String) {
+        DictationSharedState.diag("\(reason) — foreign audio in background, engines released")
+        DictationSharedState.logTrace("app stepped aside (background, foreign audio)")
+        sessionStolenByForeignApp = true
+        AppGroup.defaults.removeObject(forKey: DictationSharedState.Key.appHeartbeat)
+        captureService.releaseEnginesForForeignOwner()
+    }
+
+    /// Enters the silent keepalive when NOTHING is running but another app
+    /// is playing (the armed-capture fast yield normally catches this first;
+    /// this covers cold-launch-over-music and similar gaps).
+    private func ensureKeepAlive() {
+        guard !isActive, !isAppSession else { return }
+        // A pure-background app cannot START an engine ('!int'), and a
+        // foreign owner already holds the audio — retrying every tick while
+        // the process is awake is the churn that watchdog-kills. Wait for a
+        // foreground moment (scene .active) or the owner's .ended.
+        guard !isAppBackground || !sessionStolenByForeignApp else { return }
+        guard !captureService.isRunning, !captureService.isKeepingAlive else { return }
+        guard otherAudioPlaying else { return }
+        Self.logger.info("entering silent keepalive (nothing armed, other audio playing)")
+        DictationSharedState.logTrace("app keepalive (mic off, other audio playing)")
+        DictationSharedState.diag("policy: ensureKeepAlive (nothing armed, other audio)")
+        AppGroup.defaults.removeObject(forKey: DictationSharedState.Key.appHeartbeat)
+        captureService.startKeepAlive()
+        if isAppBackground, !captureService.isKeepingAlive {
+            // The background start was refused — never retry it while awake.
+            DictationSharedState.diag("background keepalive refused — latching until foreground")
+            sessionStolenByForeignApp = true
+        }
+    }
+
+    /// Swaps the silent keepalive back to an armed microphone after another
+    /// app's audio stopped. Uses the hot swap (`rearmFromKeepAlive`), which
+    /// never deactivates the session — so it is safe to attempt from a plain
+    /// background (the process is running and the session stays active the
+    /// whole time). If the input unit refuses the background start, the
+    /// keepalive is restored and the arm-watcher retries on a throttle; the
+    /// process never goes bare.
+    private func attemptReArmFromKeepAlive() {
+        guard !isActive, !isAppSession else { return }
+        guard captureService.isKeepingAlive else { return }
+        if isAppBackground, sessionStolenByForeignApp {
+            // The keepalive died because a foreign app (possibly silent)
+            // took the session. Do not swap to the mic over it — release
+            // and wait for `.ended` / foreground.
+            DictationSharedState.diag("keepalive→mic swap deferred — foreign session owner")
+            captureService.releaseEnginesForForeignOwner()
+            return
+        }
+        lastKeepAliveReArmAttempt = Date()
+        if captureService.rearmFromKeepAlive() {
+            DictationSharedState.touchAppHeartbeat()
+            DictationSharedState.logTrace("app re-armed after other audio stopped")
+            DictationSharedState.diag("attemptReArmFromKeepAlive → OK")
+        } else {
+            DictationSharedState.diag("attemptReArmFromKeepAlive → refused, keepalive holds")
+        }
+    }
+
+    /// Reconciles the idle audio state with the current audio environment
+    /// after an event that may have disturbed it (interruption ended, route
+    /// change, media services reset): another app playing → silent keepalive;
+    /// nothing playing → armed mic; a stale armed engine → rebuilt. Never
+    /// grabs the mic over another app's audio.
+    private func refreshIdleAudioPolicy() {
+        guard !isActive, !isAppSession else { return }
+        DictationSharedState.diag("refreshIdleAudioPolicy: running=\(captureService.isRunning) keepalive=\(captureService.isKeepingAlive) otherAudio=\(otherAudioPlaying)")
+        if captureService.isRunning {
+            if otherAudioPlaying {
+                // A yield was missed (publishLevel is the fast path) — music
+                // has priority over the idle armed mic. In the foreground a
+                // hot-swap to the silent keepalive works; once strictly
+                // backgrounded no engine can START, so release instead.
+                if isAppBackground {
+                    releaseForForeignAudioInBackground("policy: yield")
+                } else {
+                    yieldMicToOtherAudio()
+                }
+            } else if armedEngineIsStale {
+                // A REAL route/session change (interruption ended, headphone
+                // plug, media reset) killed the armed engine — its isRunning
+                // is stale on a dead engine, or it ran >5 s without a single
+                // buffer. Rebuild it.
+                //
+                // A HEALTHY engine is deliberately left alone — especially a
+                // FRESH one (see `armedEngineIsFresh`): applying a category
+                // posts a reason-3 (categoryChange) route notification, so
+                // force-re-arming on every route change re-triggers itself —
+                // stop/start → category change → route change → force
+                // re-arm → … an infinite ~3×/second engine churn that
+                // watchdog-kills a backgrounded app after a few cycles (the
+                // recurring "orange pill then app stops").
+                forceReArm()
+            }
+        } else if captureService.isKeepingAlive {
+            if otherAudioPlaying {
+                // Keepalive may have been killed (interruption / reset) while
+                // another app is still playing — bring it back so we stay
+                // alive without touching their audio.
+                captureService.repairKeepAliveIfNeeded()
+                if isAppBackground, !captureService.isKeepingAlive {
+                    // Repair = a background engine start — refused. Latch so
+                    // no tick retries it while the process is awake.
+                    DictationSharedState.diag("background keepalive repair refused — latching until foreground")
+                    sessionStolenByForeignApp = true
+                }
+            } else {
+                attemptReArmFromKeepAlive()
+            }
+        } else if otherAudioPlaying {
+            ensureKeepAlive()
+        } else {
+            ensureMicArmed(force: true)
         }
     }
 
@@ -301,15 +612,57 @@ final class KeyboardDictationCoordinator {
 
     private func armWatcherTick() async {
         guard !isActive, !isAppSession else { return }
+        if UIApplication.shared.applicationState == .background {
+            backgroundWatcherTicks += 1
+            if backgroundWatcherTicks % 6 == 0 {
+                DictationSharedState.diag("BG watcher alive (tick \(backgroundWatcherTicks)): running=\(captureService.isRunning) keepalive=\(captureService.isKeepingAlive) otherAudio=\(otherAudioPlaying)")
+            }
+        }
         if captureService.isRunning {
             if !captureService.hasRecentBuffers(within: 10) {
-                Self.logger.warning("arm watcher: engine claims running but no buffers for 10s — re-arming")
-                forceReArm()
+                if isAppBackground, otherAudioPlaying {
+                    // The engine died because a foreign app took over. The
+                    // old code force-re-armed in the background — iOS
+                    // refuses ('!int'), and each retry was a churn cycle.
+                    // Release + latch; re-arm at .ended / foreground.
+                    releaseForForeignAudioInBackground("arm watcher: dead engine, other audio")
+                } else {
+                    Self.logger.warning("arm watcher: engine claims running but no buffers for 10s — re-arming")
+                    forceReArm()
+                }
+            } else if otherAudioPlaying {
+                // Safety net if a yield was missed (publishLevel is the fast
+                // path): another app's audio must not stay silenced/degraded.
+                if isAppBackground {
+                    releaseForForeignAudioInBackground("arm watcher: yield safety net")
+                } else {
+                    yieldMicToOtherAudio()
+                }
             }
-        } else if isAppForeground || Date().timeIntervalSince(captureService.lastInterruptionEndedAt) < 30 {
+        } else if captureService.isKeepingAlive {
+            if !otherAudioPlaying {
+                // Their audio stopped. Hot-swap the silent keepalive back to
+                // the armed mic WITHOUT deactivating the session (a
+                // deactivation in the background is what lets iOS suspend —
+                // and repeated deactivate/reactivate cycles watchdog-kill —
+                // this process). If the input unit refuses the background
+                // start, rearmFromKeepAlive restores keepalive and we retry
+                // on a gentle throttle; the process never goes bare.
+                let now = Date()
+                if now.timeIntervalSince(lastKeepAliveReArmAttempt) >= 10 {
+                    attemptReArmFromKeepAlive()
+                }
+            }
+        } else if otherAudioPlaying {
+            // Nothing armed but another app is playing — the silent keepalive
+            // keeps this process alive without touching their audio.
+            ensureKeepAlive()
+        } else if isAppForeground || (Date().timeIntervalSince(captureService.lastInterruptionEndedAt) < 30 && !sessionStolenByForeignApp) {
             // Background re-arm is forbidden ('!int' 560557684) EXCEPT right
             // after an interruption ended, when the system expects us to
-            // resume. Otherwise wait for a foreground moment.
+            // resume. Otherwise wait for a foreground moment. Never re-arm
+            // while another app is playing — that would degrade their audio,
+            // and never over a foreign owner that hasn't released yet.
             ensureMicArmed(force: true)
         }
     }
@@ -454,6 +807,9 @@ final class KeyboardDictationCoordinator {
     /// engine stays armed for the new session.
     private func preemptCurrentSession() {
         Self.logger.info("preempting current session (token \(self.token.prefix(8)))")
+        // The successor session re-ducks when it starts recording; un-duck
+        // now so a long permission wait doesn't leave other apps quiet.
+        captureService.setOtherAudioDucked(false)
         finishWatchdog?.cancel()
         if status == .recording || status == .transcribing || isFinishing {
             speechService.cancelSession()
@@ -538,6 +894,7 @@ final class KeyboardDictationCoordinator {
         guard isActive, isAppSession else { return }
         stopSessionLoop()
         finishWatchdog?.cancel()
+        captureService.setOtherAudioDucked(false)
         speechService.cancelSession()
         finalizedSegments = []
         liveText = ""
@@ -561,6 +918,7 @@ final class KeyboardDictationCoordinator {
 
     private func finishAppSession() {
         guard isActive, isAppSession, isFinishing else { return }
+        captureService.setOtherAudioDucked(false)
         finishWatchdog?.cancel()
         isFinishing = false
         let text = sessionCollectedText()
@@ -615,6 +973,11 @@ final class KeyboardDictationCoordinator {
             if !captureService.isRunning {
                 try captureService.start()
             }
+            // Recognition is live — duck other apps' audio so background
+            // music dips instead of playing at full volume into the mic.
+            // (No-op unless the armed engine is the mixable playAndRecord
+            // configuration; the .record fallbacks can't duck.)
+            captureService.setOtherAudioDucked(true)
             if !isAppSession {
                 DictationSharedState.setStatus(.recording)
             }
@@ -698,6 +1061,9 @@ final class KeyboardDictationCoordinator {
 
     private func finishAndPublish() {
         guard isActive else { return }
+        // Recognition is over — bring other apps' audio back to full
+        // volume + mixing (no-op if it was never ducked).
+        captureService.setOtherAudioDucked(false)
         finishWatchdog?.cancel()
         isFinishing = false
         let text = sessionCollectedText()
@@ -927,6 +1293,7 @@ final class KeyboardDictationCoordinator {
                 // Surface in the app's own UI; never touch the keyboard protocol.
                 self.stopSessionLoop()
                 self.finishWatchdog?.cancel()
+                self.captureService.setOtherAudioDucked(false)
                 self.speechService.cancelSession()
                 self.errorMessage = message
                 self.status = .failed
@@ -947,7 +1314,46 @@ final class KeyboardDictationCoordinator {
             self?.publishLevel(level)
         }
         captureService.onInterruption = { [weak self] in
-            guard let self, self.status == .recording else { return }
+            guard let self else { return }
+            // A foreign app took the audio session. Until it releases
+            // (`.ended`) or we return to the foreground, idle background
+            // re-arms are suppressed: re-activating against an owner that
+            // won't yield (e.g. YouTube launched but plays nothing, so
+            // `isOtherAudioPlaying` stays false and the "yield to playing
+            // audio" logic never engages) cycles `.began` → re-arm →
+            // `.began` in the background — the watchdog kills an app that
+            // churns the session like that.
+            DictationSharedState.diag("interruption .began (status \(self.status.rawValue)) — session stolen")
+            self.sessionStolenByForeignApp = true
+            guard self.status == .recording else {
+                // Not mid-recording. While a session is still winding down
+                // (.transcribing / .ready) leave the engine alone — it keeps
+                // the process alive until the publish is consumed; the flag
+                // above only stops a later post-session background fight.
+                guard !self.isActive else { return }
+                if self.otherAudioPlaying {
+                    // The new owner is actually PLAYING. Foreground: the
+                    // silent keepalive coexists with it — swap now instead of
+                    // waiting for the ~10 Hz level publish (buffers stop once
+                    // the session is deactivated). Background: no engine can
+                    // START ('!int'), so release and wait for .ended.
+                    if self.isAppBackground {
+                        self.releaseForForeignAudioInBackground("interruption .began (playing owner)")
+                    } else {
+                        self.yieldMicToOtherAudio()
+                    }
+                } else if self.captureService.isRunning || self.captureService.isKeepingAlive {
+                    // A SILENT owner holds the session. Release every engine
+                    // and go quiet — the process is suspended normally
+                    // instead of being watchdog-killed for churning. Age the
+                    // heartbeat so the keyboard cold-launches us on its next
+                    // request (a bare app can't adopt one in the background).
+                    DictationSharedState.logTrace("app foreign interruption (silent owner) — engines released")
+                    AppGroup.defaults.removeObject(forKey: DictationSharedState.Key.appHeartbeat)
+                    self.captureService.releaseEnginesForForeignOwner()
+                }
+                return
+            }
             if self.isAppSession {
                 // Finalize the app-side session; the engine is force-re-armed
                 // when the interruption ends.
@@ -965,24 +1371,35 @@ final class KeyboardDictationCoordinator {
             }
         }
         captureService.onInterruptionEnded = { [weak self] in
-            // The system gave the mic back. The engine may be stale-dead
-            // with isRunning stuck true — force a clean re-arm. During a
-            // live session recovery is owned by the session-loop stall
-            // detection: a stop+start here could deactivate the audio
-            // session and suspend a backgrounded app mid-finalize.
-            guard let self, !self.isActive else { return }
-            self.forceReArm()
+            guard let self else { return }
+            // The owner released the session — idle re-arms are unblocked.
+            // (Clear even while a session is live: when it later stands down
+            // in the background, the arm-watcher must be allowed to re-arm.)
+            if self.sessionStolenByForeignApp {
+                DictationSharedState.diag("interruption .ended — foreign-owner hold released")
+            }
+            self.sessionStolenByForeignApp = false
+            // The engine may be stale-dead with isRunning stuck true —
+            // reconcile the idle audio state (armed mic if nothing else is
+            // playing, silent keepalive if the interruption left another app
+            // playing). During a live session recovery is owned by the
+            // session-loop stall detection: a stop+start here could
+            // deactivate the audio session and suspend a backgrounded app
+            // mid-finalize.
+            guard !self.isActive else { return }
+            self.refreshIdleAudioPolicy()
         }
         captureService.onRouteChanged = { [weak self] in
             guard let self, !self.isActive else { return }
-            self.forceReArm()
+            self.refreshIdleAudioPolicy()
         }
         captureService.onMediaServicesReset = { [weak self] in
             // mediaserverd died: the engine object is already swapped by
-            // AudioCaptureService. During a session the stall detection
-            // restarts capture; while idle we re-arm directly.
+            // AudioCaptureService (and a silent keepalive, if we held one,
+            // is rebuilt there). During a session the stall detection
+            // restarts capture; while idle reconcile the audio state.
             guard let self, !self.isActive else { return }
-            self.forceReArm()
+            self.refreshIdleAudioPolicy()
         }
     }
 
@@ -990,6 +1407,19 @@ final class KeyboardDictationCoordinator {
         let now = Date()
         guard now.timeIntervalSince(lastLevelPublish) >= 0.1 else { return }
         lastLevelPublish = now
+        // Fast yield path: this runs ~10x/s while the engine is armed and
+        // idle. The moment another app starts playing audio, hand the
+        // hardware over so their playback is never silenced or degraded
+        // (the arm-watcher is the 5s safety net if this ever stalls). From a
+        // strict background we cannot START the keepalive — release instead.
+        if !isActive, captureService.isRunning, otherAudioPlaying {
+            if isAppBackground {
+                releaseForForeignAudioInBackground("yield fast path")
+            } else {
+                yieldMicToOtherAudio()
+            }
+            return
+        }
         audioLevel = level
         // Only RMS above the noise floor counts as REAL speech. Silence
         // buffers keep arriving while the engine runs, so they must never
@@ -1020,12 +1450,22 @@ final class KeyboardDictationCoordinator {
         UIApplication.shared.applicationState != .background
     }
 
+    /// Strictly backgrounded (not `.inactive` — app switcher / control
+    /// center overlays are still allowed to arm). Only here do we refuse to
+    /// fight a foreign session owner.
+    private var isAppBackground: Bool {
+        UIApplication.shared.applicationState == .background
+    }
+
     /// Ends a session and clears session state. By default the status is
     /// reset to `.idle` so the main screen's record button is usable again;
     /// failure paths pass `resetStatus: false` to keep `.failed` visible.
     private func standDown(resetStatus: Bool = true) {
         stopSessionLoop()
         finishWatchdog?.cancel()
+        // No live session anymore (cancel / failure / orphan cleanup) —
+        // un-duck other apps' audio in case a session had ducked it.
+        captureService.setOtherAudioDucked(false)
         stallReArmAttemptedAt = nil
         isActive = false
         isAppSession = false

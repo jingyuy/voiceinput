@@ -88,6 +88,7 @@ final class AudioCaptureService {
     private let audioSession = AVAudioSession.sharedInstance()
     private var lastLevelDispatchTime: CFAbsoluteTime = 0
     private let levelDispatchInterval: CFAbsoluteTime = 1.0 / 30.0
+    private var lastBufferDiagTime: CFAbsoluteTime = 0
     /// True while the capture engine is running. The engine is kept running
     /// almost permanently (always-armed mic) so dictation can start instantly
     /// in the background without re-initializing the input unit.
@@ -96,9 +97,40 @@ final class AudioCaptureService {
     /// detect an engine that claims to run but is actually dead (session
     /// stolen by an interruption / route change / media reset).
     private(set) var lastBufferAt = Date.distantPast
+    /// When the current engine's `start()` succeeded. A fresh engine needs
+    /// tens of milliseconds before its FIRST buffer can arrive, so a
+    /// no-buffers check alone cannot judge a just-armed engine — callers
+    /// must give it a grace period (see `armedEngineIsFresh`).
+    private(set) var lastEngineStartAt = Date.distantPast
     /// When the last audio interruption ended — the system then permits a
     /// background re-arm (unlike the general '!int' 560557684 ban).
     private(set) var lastInterruptionEndedAt = Date.distantPast
+    /// The attempt configuration currently applied to the session (nil while
+    /// no engine is running). Set when an engine start succeeds, cleared
+    /// whenever the engine is torn down.
+    private var activeAttempt: Attempt?
+    /// True while a live dictation session has asked the system to duck other
+    /// apps' audio (background music plays softly instead of into the mic).
+    private(set) var isOtherAudioDucked = false
+    /// True while the silent keepalive session is running (see
+    /// `startKeepAlive`). Mutually exclusive with `isRunning` — never both.
+    private(set) var isKeepingAlive = false
+    private var keepAliveEngine: AVAudioEngine?
+    private var keepAlivePlayer: AVAudioPlayerNode?
+    /// True while THIS process holds the audio session active (armed capture
+    /// or silent keepalive). The session is deliberately kept active and is
+    /// NEVER deactivated for idle transitions (armed ↔ keepalive): a
+    /// backgrounded app whose session goes inactive is suspended within
+    /// seconds, and repeated background deactivate/reactivate cycles look
+    /// like session-churning to the watchdog (the app visibly "stops" after
+    /// a few). False when the system took the session (interruption began,
+    /// media-services reset) or before anything has activated it.
+    private var sessionActive = false
+    /// The capture configuration that most recently started successfully.
+    /// Survives teardown so a background keepalive→mic swap can re-apply the
+    /// exact config the hardware accepted without re-running the whole
+    /// attempt chain. Cleared on media-services reset.
+    private var lastWinningAttempt: Attempt?
 
     init() {
         NotificationCenter.default.addObserver(
@@ -111,9 +143,21 @@ final class AudioCaptureService {
                   let type = AVAudioSession.InterruptionType(rawValue: rawType) else { return }
             switch type {
             case .began:
+                DictationSharedState.diag("interruption .began — session deactivated by system")
+                // The system deactivated our session for the interruption.
+                self.sessionActive = false
                 self.onInterruption?()
             case .ended:
+                DictationSharedState.diag("interruption .ended — session needs reactivation")
                 self.lastInterruptionEndedAt = Date()
+                // The session was deactivated at .began — a resume needs a
+                // fresh activation (startKeepAlive / start do that when
+                // sessionActive is false).
+                self.sessionActive = false
+                // If the interruption hit while we were silently keeping this
+                // process alive, bring that session back before the
+                // coordinator reconciles the idle audio state.
+                self.repairKeepAliveIfNeeded()
                 self.onInterruptionEnded?()
             @unknown default:
                 break
@@ -123,7 +167,13 @@ final class AudioCaptureService {
             forName: AVAudioSession.routeChangeNotification,
             object: audioSession,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
+            // A route change can invalidate the keepalive engine (new sample
+            // rate / route) — rebuild it if it died. No-op when capture is
+            // armed (the coordinator rebuilds that on route change instead).
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).map(String.init) ?? "?"
+            DictationSharedState.diag("route change (reason \(reason))")
+            self?.repairKeepAliveIfNeeded()
             self?.onRouteChanged?()
         }
         NotificationCenter.default.addObserver(
@@ -132,10 +182,23 @@ final class AudioCaptureService {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            // mediaserverd died: every engine object is garbage. Drop it
+            DictationSharedState.diag("media services reset — all engines dropped")
+            // mediaserverd died: every engine object is garbage. Drop them
             // now so a later start() rebuilds from scratch.
             self.audioEngine = AVAudioEngine()
             self.isRunning = false
+            self.activeAttempt = nil
+            self.isOtherAudioDucked = false
+            self.sessionActive = false
+            self.lastWinningAttempt = nil
+            if self.isKeepingAlive {
+                // The silent keepalive died with the server — rebuild it so
+                // this process isn't suspended while another app plays
+                // (startKeepAlive tears the stale engine down and rebuilds).
+                self.keepAliveEngine = nil
+                self.keepAlivePlayer = nil
+                self.startKeepAlive()
+            }
             self.onMediaServicesReset?()
         }
     }
@@ -145,6 +208,10 @@ final class AudioCaptureService {
     func hasRecentBuffers(within window: TimeInterval) -> Bool {
         Date().timeIntervalSince(lastBufferAt) < window
     }
+
+    /// The real `AVAudioEngine.isRunning` — distinguishes a genuinely
+    /// running engine from a stale-true `isRunning` flag on a dead one.
+    var engineActuallyRunning: Bool { audioEngine.isRunning }
 
     // MARK: - Capture control
 
@@ -178,7 +245,22 @@ final class AudioCaptureService {
     /// input is 1ch, so the input unit rejects the engine with 'what'.
     func start() throws {
         guard !isRunning else { return }
+        // Entering capture mode always exits the silent keepalive first —
+        // both claim the same session and must never run together.
+        if isKeepingAlive {
+            stopKeepAlive()
+        }
         let attempts: [Attempt] = [
+            // The engine is ALWAYS ARMED while the app is alive, so an
+            // exclusive (non-mixing) session interrupts whatever the user
+            // is listening to — music goes silent for as long as the app
+            // stays open. `.mixWithOthers` (honored only for
+            // `.playAndRecord` / `.playback`) keeps other apps' audio
+            // playing while the mic stays warm, so it is tried FIRST. The
+            // `.record`-category attempts remain below as fallbacks for
+            // hardware that rejects playAndRecord.
+            Attempt(name: "playAndRecord/measurement/speaker+mix", category: .playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .mixWithOthers], format: nil, prefs: false, voiceProcessing: false),
+            Attempt(name: "playAndRecord/default/speaker+mix", category: .playAndRecord, mode: .default, options: [.defaultToSpeaker, .mixWithOthers], format: nil, prefs: false, voiceProcessing: false),
             Attempt(name: "record/measurement/duck", category: .record, mode: .measurement, options: [.duckOthers], format: nil, prefs: false, voiceProcessing: false),
             Attempt(name: "record/measurement/none", category: .record, mode: .measurement, options: [], format: nil, prefs: false, voiceProcessing: false),
             Attempt(name: "record/default/none", category: .record, mode: .default, options: [], format: nil, prefs: false, voiceProcessing: false),
@@ -206,7 +288,7 @@ final class AudioCaptureService {
             var started = false
             ObjCExceptionCatcher.catchException({
                 do {
-                    try self.tryStart(attempt, nodeOut: &nodeOut, nodeIn: &nodeIn)
+                    try self.tryStart(attempt, nodeOut: &nodeOut, nodeIn: &nodeIn, deactivateFirst: !self.sessionActive)
                     started = true
                 } catch {
                     attemptError = error
@@ -247,9 +329,16 @@ final class AudioCaptureService {
     /// Applies one configuration and starts the engine, installing the tap.
     /// Creates a FRESH engine after the session is configured so the input
     /// node's cached format reflects the active hardware (see `start()`).
-    private func tryStart(_ attempt: Attempt, nodeOut: inout String, nodeIn: inout String) throws {
+    private func tryStart(_ attempt: Attempt, nodeOut: inout String, nodeIn: inout String, deactivateFirst: Bool) throws {
         let session = audioSession
-        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        if deactivateFirst {
+            // Only when we do NOT already hold the session active (fresh
+            // launch, after an interruption/reset). When the session is
+            // already active (armed or keepalive), deactivating it here is
+            // exactly what lets a backgrounded app get suspended.
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            sessionActive = false
+        }
         try session.setCategory(attempt.category, mode: attempt.mode, options: attempt.options)
         if attempt.prefs {
             try? session.setPreferredSampleRate(48_000)
@@ -257,6 +346,7 @@ final class AudioCaptureService {
             try? session.setPreferredIOBufferDuration(0.02)
         }
         try session.setActive(true)
+        sessionActive = true
 
         audioEngine = AVAudioEngine()
         let inputNode = audioEngine.inputNode
@@ -270,6 +360,15 @@ final class AudioCaptureService {
         }
         audioEngine.prepare()
         try audioEngine.start()
+        lastEngineStartAt = Date()
+        DictationSharedState.diag("engine running: \(attempt.name) (deactivateFirst=\(deactivateFirst))")
+        // Remember the winning configuration so a later option swap (duck
+        // other audio during live dictation) changes ONLY the options and
+        // never the category/mode the hardware accepted.
+        activeAttempt = attempt
+        // ... and so a background keepalive→mic swap can re-apply it
+        // without re-running the whole attempt chain.
+        lastWinningAttempt = attempt
     }
 
     /// Stops the engine and removes the tap without touching the session
@@ -287,6 +386,8 @@ final class AudioCaptureService {
         // Always hand back a FRESH engine so the next start never touches a
         // broken one.
         audioEngine = AVAudioEngine()
+        activeAttempt = nil
+        isOtherAudioDucked = false
     }
 
     private static func floatFormat(rate: Double, channels: AVAudioChannelCount) -> AVAudioFormat? {
@@ -320,12 +421,275 @@ final class AudioCaptureService {
         return "node=\(node.sampleRate)/\(node.channelCount) sess=\(session.sampleRate) in=\(session.isInputAvailable ? 1 : 0) perm=\(session.recordPermission.rawValue)"
     }
 
-    /// Stops capturing and releases the microphone.
+    /// Stops capturing and releases the microphone, deactivating the audio
+    /// session. Only for real release points in the FOREGROUND — never use
+    /// this for an idle transition while the process may be backgrounded
+    /// (use `stopCaptureKeepingSession` + a hot swap instead).
     func stop() {
         guard isRunning else { return }
+        DictationSharedState.diag("capture stop() — full release, session DEACTIVATED")
         teardownEngine()
         try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
         isRunning = false
+        sessionActive = false
+    }
+
+    /// Stops the capture engine but keeps the audio session ACTIVE. The
+    /// engine must be replaced immediately (keepalive or a fresh capture
+    /// start) so a backgrounded process never loses its active session.
+    func stopCaptureKeepingSession() {
+        guard isRunning else { return }
+        DictationSharedState.diag("capture engine stopped — session KEPT active")
+        teardownEngine()
+        isRunning = false
+    }
+
+    // MARK: - Silent keepalive (stay alive without the mic)
+
+    /// Starts a silent `.playback` session (`.mixWithOthers`) that renders
+    /// digital silence. A backgrounded app only stays alive while its audio
+    /// session is active AND actually running (UIBackgroundModes audio) —
+    /// but an armed microphone is exactly what silences/degrades other
+    /// apps' audio. When another app is playing we therefore trade the mic
+    /// for this silent session: this process keeps running (instant
+    /// keyboard adoption is preserved once the mic re-arms) while the other
+    /// app's audio plays clean and untouched. Mutually exclusive with
+    /// capture (`start`/`stop`). Idempotent and rebuildable: if the flag is
+    /// set but the engine died (interruption / media reset), it rebuilds.
+    func startKeepAlive() {
+        if isKeepingAlive, keepAliveEngine?.isRunning == true { return }
+        if isRunning {
+            // Never hold the mic and the keepalive at once — same session.
+            // Hot swap: the session stays active the whole time.
+            stopCaptureKeepingSession()
+        }
+        // Drop any stale engine before rebuilding.
+        keepAlivePlayer?.stop()
+        keepAliveEngine?.stop()
+        keepAlivePlayer = nil
+        keepAliveEngine = nil
+        var exceptionReason: NSString?
+        ObjCExceptionCatcher.catchException({
+            do {
+                try self.audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                if !self.sessionActive {
+                    try self.audioSession.setActive(true)
+                    self.sessionActive = true
+                }
+                let engine = AVAudioEngine()
+                let player = AVAudioPlayerNode()
+                engine.attach(player)
+                // Resolve the format AFTER activation so it matches the
+                // current hardware route (same trap as the capture engine).
+                let format = engine.outputNode.inputFormat(forBus: 0)
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4096) else {
+                    Self.logger.error("keepalive: could not allocate silent buffer")
+                    self.isKeepingAlive = false
+                    return
+                }
+                buffer.frameLength = 4096
+                // AVAudioPCMBuffer memory is not guaranteed zeroed — make the
+                // loop genuinely silent.
+                let abl = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+                for buf in abl {
+                    if let data = buf.mData {
+                        memset(data, 0, Int(buf.mDataByteSize))
+                    }
+                }
+                engine.connect(player, to: engine.mainMixerNode, format: format)
+                engine.prepare()
+                try engine.start()
+                player.scheduleBuffer(buffer, at: nil, options: [.loops])
+                player.play()
+                self.keepAliveEngine = engine
+                self.keepAlivePlayer = player
+                self.isKeepingAlive = true
+                DictationSharedState.diag("keepalive STARTED (silent mixable playback)")
+                Self.logger.info("keepalive started (silent mixable playback)")
+            } catch {
+                self.isKeepingAlive = false
+                DictationSharedState.diag("keepalive start FAILED: \(error.localizedDescription)")
+                Self.logger.error("keepalive start failed: \(error.localizedDescription)")
+            }
+        }, outExceptionReason: &exceptionReason)
+        if let exceptionReason {
+            isKeepingAlive = false
+            Self.logger.error("keepalive start raised: \(String(exceptionReason))")
+        }
+    }
+
+    /// Stops the silent keepalive ENGINE but keeps the audio session ACTIVE.
+    /// The engine is always replaced immediately (real capture via
+    /// `rearmFromKeepAlive`, or a rebuilt keepalive), so the process never
+    /// loses its active session while backgrounded. Never deactivates — a
+    /// deactivation is the one act that lets iOS suspend a backgrounded app.
+    /// Idempotent.
+    func stopKeepAlive() {
+        guard isKeepingAlive else { return }
+        var exceptionReason: NSString?
+        ObjCExceptionCatcher.catchException({
+            self.keepAlivePlayer?.stop()
+            self.keepAliveEngine?.stop()
+        }, outExceptionReason: &exceptionReason)
+        if let exceptionReason {
+            Self.logger.warning("stopKeepAlive raised: \(String(exceptionReason))")
+        }
+        keepAlivePlayer = nil
+        keepAliveEngine = nil
+        isKeepingAlive = false
+        DictationSharedState.diag("keepalive engine stopped — session kept active")
+        Self.logger.info("keepalive engine stopped (session kept active)")
+    }
+
+    /// Releases every engine after a foreign app took the audio session
+    /// (interruption `.began`) while we were idle. The system already
+    /// deactivated the session — this never re-activates and never calls
+    /// `setActive(false)` (the deactivation already happened; notifying
+    /// others adds nothing). The point is to go QUIET: a backgrounded app
+    /// that keeps re-activating against a SILENT session owner (e.g. a
+    /// video app that launched but plays nothing, so `isOtherAudioPlaying`
+    /// is false and the "yield to playing audio" logic never engages) is
+    /// watchdog-killed after a few churn cycles. After this the process is
+    /// suspended normally; the next dictation request cold-launches it
+    /// (the designed fallback when the mic is not armed).
+    func releaseEnginesForForeignOwner() {
+        DictationSharedState.diag("engines released — foreign session owner (process will suspend)")
+        if isRunning {
+            teardownEngine()
+            isRunning = false
+        }
+        if isKeepingAlive {
+            keepAlivePlayer?.stop()
+            keepAliveEngine?.stop()
+            keepAlivePlayer = nil
+            keepAliveEngine = nil
+            isKeepingAlive = false
+        }
+        // sessionActive is already false (the system deactivated us at
+        // `.began`) and stays false until a real re-arm activates again.
+    }
+
+    /// Hot-swaps an armed capture engine to the silent keepalive WITHOUT
+    /// deactivating the audio session (safe in the background). The session
+    /// stays active and an engine is running at every instant, so the
+    /// process never becomes suspendible mid-transition.
+    func yieldToKeepAlive() {
+        guard isRunning else { return }
+        DictationSharedState.diag("YIELD: armed capture → silent keepalive (mic off)")
+        stopCaptureKeepingSession()
+        startKeepAlive()
+    }
+
+    /// The capture configurations to try when re-arming from keepalive in
+    /// the background, in order. The winning attempt is prepended when
+    /// known; these cover the first start of the process (e.g. the app was
+    /// launched directly into keepalive over music and never armed).
+    private static let rearmFallbackAttempts: [Attempt] = [
+        Attempt(name: "playAndRecord/measurement/speaker+mix", category: .playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .mixWithOthers], format: nil, prefs: false, voiceProcessing: false),
+        Attempt(name: "record/measurement/duck", category: .record, mode: .measurement, options: [.duckOthers], format: nil, prefs: false, voiceProcessing: false),
+        Attempt(name: "record/measurement/none", category: .record, mode: .measurement, options: [], format: nil, prefs: false, voiceProcessing: false),
+    ]
+
+    /// Hot-swaps the silent keepalive back to an armed capture engine
+    /// WITHOUT deactivating the audio session. Safe to attempt in the
+    /// background: the process is running (the keepalive engine keeps it
+    /// alive) and the session never goes inactive, so this cannot open a
+    /// suspension window. Returns false if the input unit refuses the
+    /// background start — the keepalive is restored and the caller retries
+    /// on a throttle. The process is never left without an engine.
+    @discardableResult
+    func rearmFromKeepAlive() -> Bool {
+        guard isKeepingAlive else { return isRunning }
+        stopKeepAlive()
+        let attempts: [Attempt]
+        if let winner = lastWinningAttempt {
+            attempts = [winner] + Self.rearmFallbackAttempts
+        } else {
+            attempts = Self.rearmFallbackAttempts
+        }
+        var nodeOut = ""
+        var nodeIn = ""
+        var lastError: Error?
+        var exceptionReason: NSString?
+        var started = false
+        for attempt in attempts {
+            ObjCExceptionCatcher.catchException({
+                do {
+                    try self.tryStart(attempt, nodeOut: &nodeOut, nodeIn: &nodeIn, deactivateFirst: false)
+                    started = true
+                } catch {
+                    lastError = error
+                }
+            }, outExceptionReason: &exceptionReason)
+            if started {
+                isRunning = true
+                DictationSharedState.diag("RE-ARM OK: \(attempt.name)")
+                Self.logger.info("background re-arm succeeded with: \(attempt.name)")
+                return true
+            }
+            teardownEngine()
+        }
+        DictationSharedState.diag("RE-ARM REFUSED: \(lastError.map { Self.errorDetail($0, copyToPasteboard: false) } ?? "unknown") — keepalive restored")
+        Self.logger.error("background re-arm refused: \(lastError.map { Self.errorDetail($0, copyToPasteboard: false) } ?? "unknown")")
+        // The session was never deactivated — bring the silent keepalive
+        // back on the still-active session.
+        startKeepAlive()
+        return false
+    }
+
+    /// Recreates the keepalive engine if the flag claims keepalive but the
+    /// engine is no longer running (an interruption, route change, or media
+    /// reset killed it while another app kept playing). Keeps this process
+    /// alive without ever grabbing the mic back.
+    func repairKeepAliveIfNeeded() {
+        guard isKeepingAlive else { return }
+        guard keepAliveEngine?.isRunning != true else { return }
+        DictationSharedState.diag("keepalive engine DEAD — rebuilding")
+        Self.logger.warning("keepalive engine dead — rebuilding")
+        keepAlivePlayer = nil
+        keepAliveEngine = nil
+        startKeepAlive()
+    }
+
+    // MARK: - Other apps' audio (mixing / ducking)
+
+    /// True while the armed session lets other apps' audio keep playing
+    /// (a `.playAndRecord` session configured with `.mixWithOthers`).
+    var isMixableWithOtherApps: Bool {
+        isRunning && (activeAttempt?.options.contains(.mixWithOthers) == true)
+    }
+
+    /// Lowers other apps' audio (music) while a live dictation session is
+    /// capturing, or restores it to full volume + mixing when dictation
+    /// ends. The always-armed session uses `.mixWithOthers` so music never
+    /// stops when the app is open; once recognition is actually running,
+    /// background music at full volume would fight the recognizer, so it is
+    /// ducked instead (iOS fades it back up when the options are restored).
+    ///
+    /// Only the OPTIONS are changed — the category/mode stay exactly as the
+    /// winning attempt configured them (re-applying a category the hardware
+    /// rejected during `start()` would break the engine). No-op for the
+    /// `.record`-category fallbacks, which cannot mix or duck.
+    func setOtherAudioDucked(_ ducked: Bool) {
+        guard ducked != isOtherAudioDucked else { return }
+        guard isRunning, let attempt = activeAttempt,
+              attempt.options.contains(.mixWithOthers) else { return }
+        let options: AVAudioSession.CategoryOptions = ducked
+            ? [.defaultToSpeaker, .duckOthers]
+            : [.defaultToSpeaker, .mixWithOthers]
+        var exceptionReason: NSString?
+        ObjCExceptionCatcher.catchException({
+            do {
+                try self.audioSession.setCategory(attempt.category, mode: attempt.mode, options: options)
+                self.isOtherAudioDucked = ducked
+                Self.logger.info("\(ducked ? "other audio ducked (dictation live)" : "other audio restored (mixWithOthers)")")
+            } catch {
+                Self.logger.error("setOtherAudioDucked(\(ducked)) failed: \(error.localizedDescription)")
+            }
+        }, outExceptionReason: &exceptionReason)
+        if let exceptionReason {
+            Self.logger.error("setOtherAudioDucked(\(ducked)) raised: \(String(exceptionReason))")
+        }
     }
 
     // MARK: - Buffer handling
@@ -334,8 +698,13 @@ final class AudioCaptureService {
         lastBufferAt = Date()
         onBuffer?(buffer)
 
-        // Throttle level updates so we don't flood the main queue.
         let now = CFAbsoluteTimeGetCurrent()
+        if now - lastBufferDiagTime >= 2 {
+            lastBufferDiagTime = now
+            DictationSharedState.diag("buffers flowing (frames=\(buffer.frameLength))")
+        }
+
+        // Throttle level updates so we don't flood the main queue.
         guard now - lastLevelDispatchTime >= levelDispatchInterval else { return }
         lastLevelDispatchTime = now
 

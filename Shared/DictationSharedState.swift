@@ -231,4 +231,63 @@ enum DictationSharedState {
     static func touchKeyboardPresence(defaults: UserDefaults = AppGroup.defaults) {
         defaults.set(Date.timeIntervalSinceReferenceDate, forKey: Key.keyboardAliveAt)
     }
+
+    // MARK: - Diagnostics file (audio-session timeline)
+
+    /// Cross-process lock for `diag` appends.
+    private static let diagLock = NSLock()
+    private static let diagFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    /// Truncates the diagnostics file (called once per app process launch so
+    /// each pulled `diag.log` describes a single run).
+    static func diagClear() {
+        diagLock.lock()
+        defer { diagLock.unlock() }
+        guard let dir = FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: AppGroup.suiteName) else { return }
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("Library/Caches/diag.log"))
+    }
+
+    /// Appends a timestamped line to `diag.log` in the shared container — a
+    /// raw audio-session timeline (armed ↔ keepalive ↔ interruption) for
+    /// debugging the background-survival state machine. Unlike `logTrace`
+    /// (a user-visible capped ring) this file is pulled off-device with:
+    ///
+    ///     xcrun devicectl device copy from --device <UDID> \
+    ///       --domain-type appGroupDataContainer \
+    ///       --domain-identifier group.com.example.AudioToTextOnMobile \
+    ///       --source Library/Caches/diag.log --destination diag.log
+    ///
+    /// Best-effort: never throws, never crashes the audio path. Capped at
+    /// ~200 KB (rotated by truncation).
+    static func diag(_ message: String) {
+        diagLock.lock()
+        defer { diagLock.unlock() }
+        guard let dir = FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: AppGroup.suiteName) else { return }
+        let url = dir.appendingPathComponent("Library/Caches/diag.log")
+        let line = "\(diagFormatter.string(from: Date())) \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        do {
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            if size > 200_000 {
+                try? FileManager.default.removeItem(at: url)
+            }
+            if FileManager.default.fileExists(atPath: url.path),
+               let handle = try? FileHandle(forWritingTo: url) {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+                try handle.close()
+            } else {
+                try data.write(to: url)
+            }
+        } catch {
+            // Diagnostics must never break the audio path.
+        }
+    }
 }
